@@ -126,7 +126,7 @@ class Edition extends Model
     public function getStatutVotesAutoAttribute()
     {
         if ($this->statut !== 'active') {
-            return 'inactif';
+            return 'en_attente';
         }
 
         $now = Carbon::now();
