@@ -3,60 +3,87 @@
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Facades\DB;
 
 return new class extends Migration
 {
     public function up(): void
     {
-        // 1. Désactiver temporairement les contraintes de clés étrangères
-        DB::statement('SET FOREIGN_KEY_CHECKS=0');
-        
-        // 2. Sauvegarder les données existantes si nécessaire
-        // (cette partie dépend de vos besoins)
-        
-        // 3. Supprimer l'ancienne table users
-        Schema::dropIfExists('users');
-        
-        // 4. Recréer la table users avec les nouvelles colonnes
-        Schema::create('users', function (Blueprint $table) {
-            $table->id();
-            $table->string('nom');
-            $table->string('prenoms');
-            $table->string('email')->unique();
-            $table->timestamp('email_verified_at')->nullable();
-            $table->string('password')->nullable(); // Nullable pour candidats
-            $table->string('telephone')->nullable();
-            $table->date('date_naissance')->nullable();
-            $table->enum('sexe', ['M', 'F', 'Autre'])->nullable();
-            $table->string('photo_url')->nullable();
-            $table->string('origine')->nullable();
-            $table->string('ethnie')->nullable();
-            $table->string('universite')->nullable();
-            $table->string('filiere')->nullable();
-            $table->string('annee_etude')->nullable();
-            $table->enum('type_compte', ['candidat', 'promoteur', 'admin'])->default('candidat');
-            $table->boolean('compte_actif')->default(true);
-            $table->rememberToken();
-            $table->timestamps();
-            $table->softDeletes();
+        Schema::table('users', function (Blueprint $table) {
+
+            // Ajouter les colonnes si elles n'existent pas
+            if (!Schema::hasColumn('users', 'nom')) {
+                $table->string('nom')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'prenoms')) {
+                $table->string('prenoms')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'telephone')) {
+                $table->string('telephone')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'date_naissance')) {
+                $table->date('date_naissance')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'sexe')) {
+                $table->enum('sexe', ['M', 'F', 'Autre'])->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'photo_url')) {
+                $table->string('photo_url')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'origine')) {
+                $table->string('origine')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'ethnie')) {
+                $table->string('ethnie')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'universite')) {
+                $table->string('universite')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'filiere')) {
+                $table->string('filiere')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'annee_etude')) {
+                $table->string('annee_etude')->nullable();
+            }
+
+            if (!Schema::hasColumn('users', 'type_compte')) {
+                $table->enum('type_compte', ['candidat', 'promoteur', 'admin'])
+                      ->default('candidat');
+            }
+
+            if (!Schema::hasColumn('users', 'compte_actif')) {
+                $table->boolean('compte_actif')->default(true);
+            }
         });
-        
-        // 5. Réactiver les contraintes de clés étrangères
-        DB::statement('SET FOREIGN_KEY_CHECKS=1');
     }
 
-    public function down(): void{
-        // Pour rollback, vous devrez peut-être recréer l'ancienne structure
-        // Cette partie dépend de votre structure précédente
-        DB::statement('SET FOREIGN_KEY_CHECKS=0');
-        Schema::dropIfExists('users');
-        
-        // Recréer l'ancienne table si nécessaire
-        // Schema::create('users', function (Blueprint $table) {
-        //     // Ancienne structure
-        // });
-        
-        DB::statement('SET FOREIGN_KEY_CHECKS=1');
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn([
+                'nom',
+                'prenoms',
+                'telephone',
+                'date_naissance',
+                'sexe',
+                'photo_url',
+                'origine',
+                'ethnie',
+                'universite',
+                'filiere',
+                'annee_etude',
+                'type_compte',
+                'compte_actif',
+            ]);
+        });
     }
 };
