@@ -132,7 +132,7 @@ class CandidatController extends Controller{
             if (!$user) {
                 $user = User::create([
                     'nom' => $data['nom'],
-                    'name' => $data['nom'],
+                    'name' => $data['nom'] . ' ' . $data['prenoms'],
                     'prenoms' => $data['prenoms'],
                     'email' => $data['email'],
                     'password' => Hash::make($data['nom']), // temporaire
