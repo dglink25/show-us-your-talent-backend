@@ -651,7 +651,7 @@ class ChatController extends Controller{
                 if ($user->type_compte === 'candidat') {
                     $candidatures = Candidature::where('candidat_id', $user->id)
                         ->where('edition_id', $edition->id)
-                        ->where('statut', 'validée')
+                        ->where('statut', 'validee')
                         ->pluck('category_id')
                         ->toArray();
 
