@@ -214,7 +214,7 @@ class AdminController extends Controller{
                     $candidaturesCategorie = Candidature::where('candidat_id', $candidature->candidat_id)
                         ->where('edition_id', $edition->id)
                         ->where('categorie_id', $categorie->id)
-                        ->where('statut', 'validee')
+                        ->where('statut', "validée")
                         ->get();
                     
                     // Pour chaque candidature, calculer la somme des fees
