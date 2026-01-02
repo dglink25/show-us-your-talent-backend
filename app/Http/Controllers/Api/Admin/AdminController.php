@@ -220,7 +220,7 @@ class AdminController extends Controller{
                     // Pour chaque candidature, calculer la somme des fees
                     foreach ($candidaturesCategorie as $candidatureCat) {
                         // Récupérer tous les paiements pour cette candidature
-                        $paiementsCandidature = Payment::where('candidature_id', $candidatureCat->id)
+                        $paiementsCandidature = Payment::where('candidat_id', $candidatureCat->candidat_id)
                             ->where('edition_id', $edition->id)
                             ->where('status', 'approved')
                             ->get();
