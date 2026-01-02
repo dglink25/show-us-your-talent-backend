@@ -582,6 +582,7 @@ class DashboardCandidatController extends Controller
 
             // Requête pour les paiements
             $paymentsQuery = Payment::where('candidat_id', $user->id)
+                                    ->where('status', 'approved')
                 ->when($request->edition_id, function ($query) use ($request) {
                     $query->where('edition_id', $request->edition_id);
                 })
