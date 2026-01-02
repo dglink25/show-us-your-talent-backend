@@ -23,8 +23,7 @@ class DashboardCandidatController extends Controller
     /**
      * Obtenir les statistiques globales du candidat
      */
-    public function getDashboardStats(Request $request): JsonResponse
-    {
+    public function getDashboardStats(Request $request): JsonResponse{
         try {
             $user = $request->user();
             
@@ -550,8 +549,8 @@ class DashboardCandidatController extends Controller
     /**
      * Obtenir la liste des votes (paiements)
      */
-    public function getVotesList(Request $request): JsonResponse
-    {
+
+    public function getVotesList(Request $request): JsonResponse {
         try {
             $user = $request->user();
             
@@ -562,15 +561,15 @@ class DashboardCandidatController extends Controller
                 ], 401);
             }
 
+            // Validation simplifiée
             $validator = Validator::make($request->all(), [
-                'edition_id' => 'required|exists:editions,id',
+                'edition_id' => 'nullable|exists:editions,id',
                 'category_id' => 'nullable|exists:categories,id',
                 'search' => 'nullable|string',
                 'date_from' => 'nullable|date',
                 'date_to' => 'nullable|date',
-                'sort_by' => 'nullable|in:created_at,amount,customer_email',
-                'sort_order' => 'nullable|in:asc,desc',
-                'status' => 'nullable|in:all,approved,pending,cancelled,failed'
+                'page' => 'nullable|integer|min:1',
+                'per_page' => 'nullable|integer|min:1|max:100'
             ]);
 
             if ($validator->fails()) {
@@ -581,24 +580,11 @@ class DashboardCandidatController extends Controller
                 ], 422);
             }
 
-            // Vérifier la participation
-            $participation = Candidature::where('candidat_id', $user->id)
-                ->where('edition_id', $request->edition_id)
-                ->when($request->category_id, function ($query) use ($request) {
-                    $query->where('category_id', $request->category_id);
-                })
-                ->first();
-
-            if (!$participation) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Vous ne participez pas à cette édition/catégorie'
-                ], 403);
-            }
-
             // Requête pour les paiements
             $paymentsQuery = Payment::where('candidat_id', $user->id)
-                ->where('edition_id', $request->edition_id)
+                ->when($request->edition_id, function ($query) use ($request) {
+                    $query->where('edition_id', $request->edition_id);
+                })
                 ->when($request->category_id, function ($query) use ($request) {
                     $query->where('category_id', $request->category_id);
                 })
@@ -615,19 +601,8 @@ class DashboardCandidatController extends Controller
                 ->when($request->date_to, function ($query) use ($request) {
                     $query->whereDate('created_at', '<=', $request->date_to);
                 })
-                ->when($request->status && $request->status !== 'all', function ($query) use ($request) {
-                    if ($request->status === 'approved') {
-                        $query->whereIn('status', ['approved', 'completed', 'paid', 'success']);
-                    } else {
-                        $query->where('status', $request->status);
-                    }
-                })
-                ->with(['edition:id,nom', 'category:id,nom', 'candidat:id,nom,prenoms']);
-
-            // Tri
-            $sortBy = $request->sort_by ?? 'created_at';
-            $sortOrder = $request->sort_order ?? 'desc';
-            $paymentsQuery->orderBy($sortBy, $sortOrder);
+                ->with(['edition:id,nom', 'category:id,nom', 'candidat:id,nom,prenoms'])
+                ->orderBy('created_at', 'desc');
 
             // Pagination
             $perPage = $request->per_page ?? 20;
@@ -660,9 +635,11 @@ class DashboardCandidatController extends Controller
                 ];
             });
 
-            // Statistiques de la période
+            // Statistiques
             $statsQuery = Payment::where('candidat_id', $user->id)
-                ->where('edition_id', $request->edition_id)
+                ->when($request->edition_id, function ($query) use ($request) {
+                    $query->where('edition_id', $request->edition_id);
+                })
                 ->when($request->category_id, function ($query) use ($request) {
                     $query->where('category_id', $request->category_id);
                 })
@@ -671,21 +648,25 @@ class DashboardCandidatController extends Controller
                 })
                 ->when($request->date_to, function ($query) use ($request) {
                     $query->whereDate('created_at', '<=', $request->date_to);
-                })
-                ->whereIn('status', ['approved', 'completed', 'paid', 'success']);
+                });
 
-            $paymentsForStats = $statsQuery->get();
-            $totalVotes = $paymentsForStats->sum(function ($payment) {
+            $allPayments = $statsQuery->get();
+            $approvedPayments = $allPayments->whereIn('status', ['approved', 'completed', 'paid', 'success']);
+
+            $totalVotes = $approvedPayments->sum(function ($payment) {
                 return $payment->metadata['votes_count'] ?? 1;
             });
 
             $stats = [
                 'total_votes' => $totalVotes,
-                'total_amount' => (float) $paymentsForStats->sum('amount'),
-                'unique_voters' => $paymentsForStats->unique('customer_email')->count(),
-                'avg_vote_amount' => $totalVotes > 0 ? round($paymentsForStats->sum('amount') / $totalVotes, 2) : 0,
-                'total_payments' => $paymentsForStats->count(),
-                'avg_payment_amount' => $paymentsForStats->count() > 0 ? round($paymentsForStats->sum('amount') / $paymentsForStats->count(), 2) : 0
+                'total_amount' => (float) $approvedPayments->sum('amount'),
+                'unique_voters' => $approvedPayments->unique('customer_email')->count(),
+                'avg_vote_amount' => $totalVotes > 0 ? round($approvedPayments->sum('amount') / $totalVotes, 2) : 0,
+                'total_payments' => $allPayments->count(),
+                'approved_payments' => $approvedPayments->count(),
+                'pending_payments' => $allPayments->where('status', 'pending')->count(),
+                'cancelled_payments' => $allPayments->where('status', 'cancelled')->count(),
+                'failed_payments' => $allPayments->where('status', 'failed')->count()
             ];
 
             return response()->json([
@@ -701,12 +682,12 @@ class DashboardCandidatController extends Controller
                         'to' => $payments->lastItem()
                     ],
                     'stats' => $stats,
-                    'filters' => $request->only(['edition_id', 'category_id', 'search', 'date_from', 'date_to', 'sort_by', 'sort_order', 'status'])
+                    'filters' => $request->only(['edition_id', 'category_id', 'search', 'date_from', 'date_to'])
                 ]
             ]);
 
         } catch (\Exception $e) {
-            Log::error('Erreur récupération liste votes', [
+            \Log::error('Erreur récupération liste votes', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
