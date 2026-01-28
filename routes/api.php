@@ -22,7 +22,7 @@ Route::get('/payment/cancel/{token}', [PaymentController::class, 'redirectCancel
     ->name('payment.redirect.cancel');
 
 // Routes publiques
-Route::middleware(['api', 'throttle:60,1'])->group(function () {
+Route::middleware(['api'])->group(function () {
     // Routes publiques existantes...
     
     // Webhook FedaPay - accepter GET et POST
@@ -39,7 +39,7 @@ Route::get('/payments/redirect-handler', function() {
     return view('payments.redirect_handler');
 });
 
-Route::middleware(['api', 'throttle:60,1'])->group(function () {
+Route::middleware(['api'])->group(function () {
 
     Route::get('/payments/callback', [PaymentController::class, 'fedapayCallback'])->name('payment.callback');
     // Routes publiques
