@@ -25,8 +25,7 @@ class PaymentController extends Controller
     /**
      * Initialiser un paiement
      */
-    public function initiatePayment(Request $request): JsonResponse
-    {
+    public function initiatePayment(Request $request): JsonResponse {
         DB::beginTransaction();
 
         try {
@@ -42,6 +41,7 @@ class PaymentController extends Controller
             ]);
 
             if ($validator->fails()) {
+                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Erreur de validation',
@@ -54,6 +54,7 @@ class PaymentController extends Controller
             // Valider et formater le téléphone
             $phone = $this->validateAndFormatPhone($data['phone']);
             if (!$phone) {
+                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Numéro de téléphone invalide',
@@ -64,6 +65,7 @@ class PaymentController extends Controller
             $edition = Edition::findOrFail($data['edition_id']);
             
             if (!$edition->isVoteOpen()) {
+                DB::rollBack();
                 return response()->json([
                     'success' => false,
                     'message' => 'Les votes ne sont pas ouverts pour cette édition.'
@@ -82,6 +84,7 @@ class PaymentController extends Controller
                     ->first();
 
                 if (!$candidature) {
+                    DB::rollBack();
                     return response()->json([
                         'success' => false,
                         'message' => 'Ce candidat ne participe pas à cette catégorie.'
@@ -142,7 +145,8 @@ class PaymentController extends Controller
                 ]
             ]);
 
-        } catch (\Exception $e) {
+        } 
+        catch (\Exception $e) {
             DB::rollBack();
             
             Log::error('Erreur initiation paiement', [
