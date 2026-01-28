@@ -3,12 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Payment;
-use App\Models\Vote;
-use App\Models\Candidature;
-use App\Models\User;
-use App\Models\Edition;
-use App\Models\Category;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
@@ -23,30 +17,21 @@ class PaymentController extends Controller
     private $votePrice = 100;
 
     /**
-     * Initialiser un paiement
+     * Initialiser un paiement - Version SANS transactions
      */
     public function initiatePayment(Request $request): JsonResponse {
         try {
-            $validator = Validator::make($request->all(), [
-                'candidat_id' => 'required|exists:users,id',
-                'edition_id' => 'required|exists:editions,id',
-                'category_id' => 'nullable|exists:categories,id',
-                'votes_count' => 'required|integer|min:1|max:100',
-                'email' => 'required|email|max:100',
-                'phone' => 'required|string|min:8|max:15',
-                'firstname' => 'required|string|max:50',
-                'lastname' => 'required|string|max:50'
-            ]);
-
-            if ($validator->fails()) {
+            // Validation manuelle SANS utiliser la validation Laravel qui peut créer des transactions
+            $errors = $this->validatePaymentRequest($request);
+            if (!empty($errors)) {
                 return response()->json([
                     'success' => false,
                     'message' => 'Erreur de validation',
-                    'errors' => $validator->errors()
+                    'errors' => $errors
                 ], 422);
             }
 
-            $data = $validator->validated();
+            $data = $request->all();
             
             // Valider et formater le téléphone
             $phone = $this->validateAndFormatPhone($data['phone']);
@@ -58,23 +43,8 @@ class PaymentController extends Controller
                 ], 422);
             }
 
-            // Vérifier si l'édition existe SANS utiliser de transactions qui pourraient être corrompues
-            $edition = null;
-            try {
-                // Utiliser une connexion directe pour éviter les problèmes de transaction
-                $edition = DB::table('editions')->find($data['edition_id']);
-                if ($edition) {
-                    $edition = (object) $edition;
-                }
-            } catch (\Exception $e) {
-                Log::error('Erreur lors de la récupération de l\'édition', [
-                    'error' => $e->getMessage(),
-                    'edition_id' => $data['edition_id']
-                ]);
-                
-                // Même si l'édition n'existe pas, on continue et on l'indiquera dans la réponse
-                $edition = null;
-            }
+            // Vérifier si l'édition existe - méthode SANS transaction
+            $edition = $this->getEditionSafely($data['edition_id']);
             
             // Vérifier si les votes sont ouverts
             $isVoteOpen = false;
@@ -90,25 +60,11 @@ class PaymentController extends Controller
                 $now = Carbon::now();
                 if ($dateDebut && $dateFin) {
                     $isVoteOpen = $now->between($dateDebut, $dateFin);
-                } else {
-                    // Si les dates ne sont pas définies, on considère que les votes sont fermés
-                    $isVoteOpen = false;
                 }
             }
 
-            // Récupérer le candidat
-            $candidat = null;
-            try {
-                $candidat = DB::table('users')->find($data['candidat_id']);
-                if ($candidat) {
-                    $candidat = (object) $candidat;
-                }
-            } catch (\Exception $e) {
-                Log::error('Erreur lors de la récupération du candidat', [
-                    'error' => $e->getMessage(),
-                    'candidat_id' => $data['candidat_id']
-                ]);
-            }
+            // Récupérer le candidat - méthode SANS transaction
+            $candidat = $this->getCandidatSafely($data['candidat_id']);
             
             if (!$candidat) {
                 return response()->json([
@@ -121,83 +77,56 @@ class PaymentController extends Controller
             $categoryName = 'Non spécifiée';
             
             if (!empty($data['category_id'])) {
-                try {
-                    $category = DB::table('categories')->find($data['category_id']);
-                    if ($category) {
-                        $category = (object) $category;
-                        $categoryName = $category->nom ?? 'Non spécifiée';
+                $category = $this->getCategorySafely($data['category_id']);
+                if ($category) {
+                    $categoryName = $category->nom ?? 'Non spécifiée';
+                    
+                    // Vérifier la candidature SANS transaction
+                    $candidatureExists = $this->checkCandidatureExists(
+                        $data['candidat_id'],
+                        $data['edition_id'],
+                        $data['category_id']
+                    );
                         
-                        // Vérifier la candidature
-                        $candidature = DB::table('candidatures')
-                            ->where('candidat_id', $data['candidat_id'])
-                            ->where('edition_id', $data['edition_id'])
-                            ->where('category_id', $data['category_id'])
-                            ->first();
-                            
-                        if (!$candidature) {
-                            return response()->json([
-                                'success' => false,
-                                'message' => 'Ce candidat ne participe pas à cette catégorie.'
-                            ], 400);
-                        }
+                    if (!$candidatureExists) {
+                        return response()->json([
+                            'success' => false,
+                            'message' => 'Ce candidat ne participe pas à cette catégorie.'
+                        ], 400);
                     }
-                } catch (\Exception $e) {
-                    Log::error('Erreur lors de la récupération de la catégorie', [
-                        'error' => $e->getMessage(),
-                        'category_id' => $data['category_id']
-                    ]);
                 }
             }
 
             $amount = $this->votePrice * $data['votes_count'];
             $candidatName = ($candidat->nom_complet ?? $candidat->nom ?? '') . ' ' . ($candidat->prenoms ?? '');
 
-            // Création du paiement
-            $paymentData = [
+            // Création du paiement - méthode SANS transaction
+            $paymentData = $this->createPaymentSafely([
                 'reference' => 'VOTE-' . strtoupper(Str::random(10)),
                 'user_id' => null,
                 'edition_id' => $data['edition_id'],
                 'candidat_id' => $data['candidat_id'],
                 'category_id' => !empty($data['category_id']) ? $data['category_id'] : null,
-                'transaction_id' => null,
                 'amount' => $amount,
-                'montant' => $amount,
                 'currency' => 'XOF',
                 'status' => 'pending',
                 'payment_token' => Str::uuid(),
-                'payment_method' => null,
                 'customer_email' => $data['email'],
-                'email_payeur' => $data['email'],
                 'customer_phone' => $phone,
                 'customer_firstname' => $data['firstname'],
                 'customer_lastname' => $data['lastname'],
-                'metadata' => [
-                    'votes_count' => $data['votes_count'],
-                    'vote_price' => $this->votePrice,
-                    'candidat_name' => $candidatName,
-                    'edition_name' => $editionName,
-                    'category_name' => $categoryName,
-                    'is_vote_open' => $isVoteOpen,
-                    'ip_address' => $request->ip(),
-                    'user_agent' => $request->userAgent(),
-                    'created_at' => Carbon::now()->toISOString()
-                ],
-                'expires_at' => Carbon::now()->addMinutes(30),
-                'created_at' => Carbon::now(),
-                'updated_at' => Carbon::now()
-            ];
+                'votes_count' => $data['votes_count'],
+                'vote_price' => $this->votePrice,
+                'candidat_name' => $candidatName,
+                'edition_name' => $editionName,
+                'category_name' => $categoryName,
+                'is_vote_open' => $isVoteOpen,
+                'ip_address' => $request->ip(),
+                'user_agent' => $request->userAgent()
+            ]);
 
-            // Insertion directe sans Eloquent pour éviter les problèmes de transaction
-            try {
-                $paymentId = DB::table('payments')->insertGetId($paymentData);
-                $paymentData['id'] = $paymentId;
-            } catch (\Exception $e) {
-                Log::error('Erreur lors de la création du paiement', [
-                    'error' => $e->getMessage(),
-                    'payment_data' => $paymentData
-                ]);
-                
-                throw $e;
+            if (!$paymentData) {
+                throw new \Exception('Échec de la création du paiement');
             }
 
             $responseData = [
@@ -244,26 +173,332 @@ class PaymentController extends Controller
     }
 
     /**
+     * Validation manuelle SANS transaction
+     */
+    private function validatePaymentRequest(Request $request): array {
+        $errors = [];
+        $data = $request->all();
+
+        // Validation du candidat
+        if (empty($data['candidat_id'])) {
+            $errors['candidat_id'] = ['Le champ candidat est requis.'];
+        } else {
+            // Vérification directe SANS Eloquent
+            $candidatExists = $this->recordExists('users', $data['candidat_id']);
+            if (!$candidatExists) {
+                $errors['candidat_id'] = ['Le candidat sélectionné n\'existe pas.'];
+            }
+        }
+
+        // Validation de l'édition
+        if (empty($data['edition_id'])) {
+            $errors['edition_id'] = ['Le champ édition est requis.'];
+        } else {
+            $editionExists = $this->recordExists('editions', $data['edition_id']);
+            if (!$editionExists) {
+                $errors['edition_id'] = ['L\'édition sélectionnée n\'existe pas.'];
+            }
+        }
+
+        // Validation de la catégorie (optionnelle)
+        if (!empty($data['category_id'])) {
+            $categoryExists = $this->recordExists('categories', $data['category_id']);
+            if (!$categoryExists) {
+                $errors['category_id'] = ['La catégorie sélectionnée n\'existe pas.'];
+            }
+        }
+
+        // Validation des votes
+        if (empty($data['votes_count'])) {
+            $errors['votes_count'] = ['Le nombre de votes est requis.'];
+        } elseif (!is_numeric($data['votes_count']) || $data['votes_count'] < 1 || $data['votes_count'] > 100) {
+            $errors['votes_count'] = ['Le nombre de votes doit être entre 1 et 100.'];
+        }
+
+        // Validation de l'email
+        if (empty($data['email'])) {
+            $errors['email'] = ['L\'email est requis.'];
+        } elseif (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+            $errors['email'] = ['L\'email doit être une adresse email valide.'];
+        } elseif (strlen($data['email']) > 100) {
+            $errors['email'] = ['L\'email ne doit pas dépasser 100 caractères.'];
+        }
+
+        // Validation du téléphone
+        if (empty($data['phone'])) {
+            $errors['phone'] = ['Le téléphone est requis.'];
+        } elseif (strlen($data['phone']) < 8 || strlen($data['phone']) > 15) {
+            $errors['phone'] = ['Le téléphone doit avoir entre 8 et 15 caractères.'];
+        }
+
+        // Validation du prénom
+        if (empty($data['firstname'])) {
+            $errors['firstname'] = ['Le prénom est requis.'];
+        } elseif (strlen($data['firstname']) > 50) {
+            $errors['firstname'] = ['Le prénom ne doit pas dépasser 50 caractères.'];
+        }
+
+        // Validation du nom
+        if (empty($data['lastname'])) {
+            $errors['lastname'] = ['Le nom est requis.'];
+        } elseif (strlen($data['lastname']) > 50) {
+            $errors['lastname'] = ['Le nom ne doit pas dépasser 50 caractères.'];
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Vérifier si un enregistrement existe SANS transaction
+     */
+    private function recordExists(string $table, $id): bool {
+        try {
+            // Utiliser une nouvelle connexion PDO directe pour éviter les transactions
+            $pdo = DB::connection()->getPdo();
+            
+            // Désactiver les éventuelles transactions en cours
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("SELECT EXISTS(SELECT 1 FROM {$table} WHERE id = :id)");
+            $stmt->execute([':id' => $id]);
+            return (bool) $stmt->fetchColumn();
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur vérification existence enregistrement', [
+                'table' => $table,
+                'id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Récupérer une édition SANS transaction
+     */
+    private function getEditionSafely($id) {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            // S'assurer qu'il n'y a pas de transaction en cours
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("SELECT * FROM editions WHERE id = :id");
+            $stmt->execute([':id' => $id]);
+            $result = $stmt->fetch(\PDO::FETCH_OBJ);
+            
+            return $result;
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur récupération édition', [
+                'edition_id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Récupérer un candidat SANS transaction
+     */
+    private function getCandidatSafely($id) {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id");
+            $stmt->execute([':id' => $id]);
+            $result = $stmt->fetch(\PDO::FETCH_OBJ);
+            
+            return $result;
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur récupération candidat', [
+                'candidat_id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Récupérer une catégorie SANS transaction
+     */
+    private function getCategorySafely($id) {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("SELECT * FROM categories WHERE id = :id");
+            $stmt->execute([':id' => $id]);
+            $result = $stmt->fetch(\PDO::FETCH_OBJ);
+            
+            return $result;
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur récupération catégorie', [
+                'category_id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Vérifier si une candidature existe SANS transaction
+     */
+    private function checkCandidatureExists($candidatId, $editionId, $categoryId): bool {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("
+                SELECT EXISTS(
+                    SELECT 1 FROM candidatures 
+                    WHERE candidat_id = :candidat_id 
+                    AND edition_id = :edition_id 
+                    AND category_id = :category_id
+                )
+            ");
+            
+            $stmt->execute([
+                ':candidat_id' => $candidatId,
+                ':edition_id' => $editionId,
+                ':category_id' => $categoryId
+            ]);
+            
+            return (bool) $stmt->fetchColumn();
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur vérification candidature', [
+                'candidat_id' => $candidatId,
+                'edition_id' => $editionId,
+                'category_id' => $categoryId,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Créer un paiement SANS transaction
+     */
+    private function createPaymentSafely(array $data): ?array {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $paymentToken = $data['payment_token'] ?? Str::uuid();
+            $metadata = json_encode([
+                'votes_count' => $data['votes_count'],
+                'vote_price' => $data['vote_price'],
+                'candidat_name' => $data['candidat_name'],
+                'edition_name' => $data['edition_name'],
+                'category_name' => $data['category_name'],
+                'is_vote_open' => $data['is_vote_open'],
+                'ip_address' => $data['ip_address'],
+                'user_agent' => $data['user_agent'],
+                'created_at' => Carbon::now()->toISOString()
+            ]);
+            
+            $expiresAt = Carbon::now()->addMinutes(30);
+            
+            $sql = "
+                INSERT INTO payments (
+                    reference, user_id, edition_id, candidat_id, category_id,
+                    transaction_id, amount, montant, currency, status,
+                    payment_token, payment_method, customer_email, email_payeur,
+                    customer_phone, customer_firstname, customer_lastname,
+                    metadata, expires_at, created_at, updated_at
+                ) VALUES (
+                    :reference, :user_id, :edition_id, :candidat_id, :category_id,
+                    :transaction_id, :amount, :montant, :currency, :status,
+                    :payment_token, :payment_method, :customer_email, :email_payeur,
+                    :customer_phone, :customer_firstname, :customer_lastname,
+                    :metadata, :expires_at, :created_at, :updated_at
+                ) RETURNING id
+            ";
+            
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([
+                ':reference' => $data['reference'],
+                ':user_id' => $data['user_id'],
+                ':edition_id' => $data['edition_id'],
+                ':candidat_id' => $data['candidat_id'],
+                ':category_id' => $data['category_id'],
+                ':transaction_id' => null,
+                ':amount' => $data['amount'],
+                ':montant' => $data['amount'],
+                ':currency' => $data['currency'],
+                ':status' => 'pending',
+                ':payment_token' => $paymentToken,
+                ':payment_method' => null,
+                ':customer_email' => $data['customer_email'],
+                ':email_payeur' => $data['customer_email'],
+                ':customer_phone' => $data['customer_phone'],
+                ':customer_firstname' => $data['customer_firstname'],
+                ':customer_lastname' => $data['customer_lastname'],
+                ':metadata' => $metadata,
+                ':expires_at' => $expiresAt,
+                ':created_at' => Carbon::now(),
+                ':updated_at' => Carbon::now()
+            ]);
+            
+            $paymentId = $stmt->fetchColumn();
+            
+            return [
+                'id' => $paymentId,
+                'payment_token' => $paymentToken,
+                'expires_at' => $expiresAt
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur création paiement', [
+                'error' => $e->getMessage(),
+                'data' => $data
+            ]);
+            return null;
+        }
+    }
+
+    /**
      * Traiter le paiement
      */
     public function processPayment(Request $request): JsonResponse{
         try {
-            $validator = Validator::make($request->all(), [
-                'payment_token' => 'required|exists:payments,payment_token',
-                'payment_method' => 'required|in:mobile_money,card'
-            ]);
-
-            if ($validator->fails()) {
+            // Validation basique
+            if (empty($request->payment_token) || empty($request->payment_method)) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Token de paiement invalide'
+                    'message' => 'Token de paiement et méthode de paiement sont requis'
+                ], 422);
+            }
+            
+            if (!in_array($request->payment_method, ['mobile_money', 'card'])) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Méthode de paiement invalide'
                 ], 422);
             }
 
-            // Récupérer le paiement directement sans Eloquent
-            $payment = DB::table('payments')
-                ->where('payment_token', $request->payment_token)
-                ->first();
+            // Récupérer le paiement SANS transaction
+            $payment = $this->getPaymentByToken($request->payment_token);
             
             if (!$payment) {
                 return response()->json([
@@ -271,10 +506,6 @@ class PaymentController extends Controller
                     'message' => 'Paiement non trouvé'
                 ], 404);
             }
-            
-            // Convertir en objet
-            $payment = (object) $payment;
-            $metadata = json_decode($payment->metadata, true) ?? [];
 
             // Vérifier les statuts qui permettent de retenter le paiement
             $allowedStatuses = ['pending', 'processing', 'failed', 'cancelled', 'expired'];
@@ -288,67 +519,32 @@ class PaymentController extends Controller
 
             // Vérifier si le paiement a expiré
             if ($payment->expires_at && Carbon::parse($payment->expires_at)->isPast()) {
-                DB::table('payments')
-                    ->where('id', $payment->id)
-                    ->update(['status' => 'expired']);
-                    
+                $this->updatePaymentStatus($payment->id, 'expired');
                 return response()->json([
                     'success' => false,
                     'message' => 'Le paiement a expiré'
                 ], 400);
             }
 
-            // Vérifier si l'édition existe toujours et si les votes sont ouverts
-            $isVoteOpen = false;
-            try {
-                $edition = DB::table('editions')->find($payment->edition_id);
-                if ($edition) {
-                    $dateDebut = $edition->date_debut_vote ? Carbon::parse($edition->date_debut_vote) : null;
-                    $dateFin = $edition->date_fin_vote ? Carbon::parse($edition->date_fin_vote) : null;
-                    
-                    $now = Carbon::now();
-                    if ($dateDebut && $dateFin) {
-                        $isVoteOpen = $now->between($dateDebut, $dateFin);
-                    }
-                }
-            } catch (\Exception $e) {
-                Log::warning('Erreur vérification ouverture votes', [
-                    'error' => $e->getMessage(),
-                    'edition_id' => $payment->edition_id
-                ]);
-                // On continue même si la vérification échoue
-            }
+            // Vérifier si les votes sont ouverts
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            $isVoteOpen = $metadata['is_vote_open'] ?? false;
 
             // Si le paiement était annulé ou échoué, le réinitialiser
             if (in_array($payment->status, ['cancelled', 'failed', 'expired'])) {
-                $importantMetadata = [
-                    'votes_count' => $metadata['votes_count'] ?? 1,
-                    'vote_price' => $metadata['vote_price'] ?? $this->votePrice,
-                    'candidat_name' => $metadata['candidat_name'] ?? '',
-                    'edition_name' => $metadata['edition_name'] ?? '',
-                    'category_name' => $metadata['category_name'] ?? '',
-                    'is_vote_open' => $isVoteOpen,
-                    'ip_address' => $metadata['ip_address'] ?? null,
-                    'user_agent' => $metadata['user_agent'] ?? null,
-                    'created_at' => $metadata['created_at'] ?? Carbon::now()->toISOString(),
-                    'previous_status' => $payment->status,
-                    'retry_count' => ($metadata['retry_count'] ?? 0) + 1,
-                    'retry_at' => Carbon::now()->toISOString()
-                ];
+                $metadata['previous_status'] = $payment->status;
+                $metadata['retry_count'] = ($metadata['retry_count'] ?? 0) + 1;
+                $metadata['retry_at'] = Carbon::now()->toISOString();
                 
-                DB::table('payments')
-                    ->where('id', $payment->id)
-                    ->update([
-                        'status' => 'pending',
-                        'transaction_id' => null,
-                        'payment_method' => null,
-                        'metadata' => json_encode($importantMetadata),
-                        'expires_at' => Carbon::now()->addMinutes(30),
-                        'updated_at' => Carbon::now()
-                    ]);
-                    
+                $this->updatePayment($payment->id, [
+                    'status' => 'pending',
+                    'transaction_id' => null,
+                    'payment_method' => null,
+                    'metadata' => json_encode($metadata),
+                    'expires_at' => Carbon::now()->addMinutes(30)
+                ]);
+                
                 $payment->status = 'pending';
-                $metadata = $importantMetadata;
             }
 
             return $this->processFedaPayPayment($payment, $request->payment_method);
@@ -364,6 +560,73 @@ class PaymentController extends Controller
                 'success' => false,
                 'message' => 'Erreur lors du traitement du paiement: ' . $e->getMessage()
             ], 500);
+        }
+    }
+
+    /**
+     * Récupérer un paiement par token SANS transaction
+     */
+    private function getPaymentByToken(string $token) {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $stmt = $pdo->prepare("SELECT * FROM payments WHERE payment_token = :token");
+            $stmt->execute([':token' => $token]);
+            return $stmt->fetch(\PDO::FETCH_OBJ);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur récupération paiement', [
+                'token' => $token,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Mettre à jour le statut d'un paiement SANS transaction
+     */
+    private function updatePaymentStatus($paymentId, $status): bool {
+        return $this->updatePayment($paymentId, ['status' => $status]);
+    }
+
+    /**
+     * Mettre à jour un paiement SANS transaction
+     */
+    private function updatePayment($paymentId, array $data): bool {
+        try {
+            $pdo = DB::connection()->getPdo();
+            
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            $fields = [];
+            $params = [':id' => $paymentId];
+            
+            foreach ($data as $key => $value) {
+                $fields[] = "{$key} = :{$key}";
+                $params[":{$key}"] = $value;
+            }
+            
+            $fields[] = "updated_at = :updated_at";
+            $params[':updated_at'] = Carbon::now();
+            
+            $sql = "UPDATE payments SET " . implode(', ', $fields) . " WHERE id = :id";
+            
+            $stmt = $pdo->prepare($sql);
+            return $stmt->execute($params);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur mise à jour paiement', [
+                'payment_id' => $paymentId,
+                'error' => $e->getMessage()
+            ]);
+            return false;
         }
     }
 
@@ -463,15 +726,12 @@ class PaymentController extends Controller
                 'payment_url' => $paymentUrl
             ]);
             
-            DB::table('payments')
-                ->where('id', $payment->id)
-                ->update([
-                    'transaction_id' => $transactionId,
-                    'payment_method' => $paymentMethod,
-                    'status' => 'processing',
-                    'metadata' => json_encode($metadata),
-                    'updated_at' => Carbon::now()
-                ]);
+            $this->updatePayment($payment->id, [
+                'transaction_id' => $transactionId,
+                'payment_method' => $paymentMethod,
+                'status' => 'processing',
+                'metadata' => json_encode($metadata)
+            ]);
 
             return response()->json([
                 'success' => true,
@@ -501,6 +761,50 @@ class PaymentController extends Controller
         }
     }
 
+    /**
+     * Méthodes auxiliaires (inchangées)
+     */
+    private function validateAndFormatPhone($phone): ?string {
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+        
+        if (empty($cleanPhone) || strlen($cleanPhone) < 8) {
+            return null;
+        }
+
+        if (str_starts_with($cleanPhone, '0') && strlen($cleanPhone) === 10) {
+            return '229' . substr($cleanPhone, 1);
+        }
+
+        if (str_starts_with($cleanPhone, '229')) {
+            if (strlen($cleanPhone) === 11) {
+                return $cleanPhone;
+            }
+            if (strlen($cleanPhone) > 11) {
+                return substr($cleanPhone, 0, 11);
+            }
+        }
+
+        if (strlen($cleanPhone) >= 8 && strlen($cleanPhone) <= 9) {
+            $base = substr($cleanPhone, 0, 8);
+            return '229' . $base;
+        }
+
+        return null;
+    }
+
+    private function formatPhoneForFedapay($phone): string{
+        $phone = $this->validateAndFormatPhone($phone);
+        if (!$phone) {
+            throw new \Exception('Numéro de téléphone invalide');
+        }
+        
+        if (strlen($phone) !== 11) {
+            throw new \Exception('Numéro de téléphone doit être 229 suivi de 8 chiffres');
+        }
+        
+        return '+' . $phone;
+    }
+   
     /**
      * Vérifier le statut du paiement
      */
@@ -753,49 +1057,6 @@ class PaymentController extends Controller
         }
     }
 
-    /**
-     * Méthodes auxiliaires
-     */
-    private function validateAndFormatPhone($phone): ?string {
-        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
-        
-        if (empty($cleanPhone) || strlen($cleanPhone) < 8) {
-            return null;
-        }
-
-        if (str_starts_with($cleanPhone, '0') && strlen($cleanPhone) === 10) {
-            return '229' . substr($cleanPhone, 1);
-        }
-
-        if (str_starts_with($cleanPhone, '229')) {
-            if (strlen($cleanPhone) === 11) {
-                return $cleanPhone;
-            }
-            if (strlen($cleanPhone) > 11) {
-                return substr($cleanPhone, 0, 11);
-            }
-        }
-
-        if (strlen($cleanPhone) >= 8 && strlen($cleanPhone) <= 9) {
-            $base = substr($cleanPhone, 0, 8);
-            return '229' . $base;
-        }
-
-        return null;
-    }
-
-    private function formatPhoneForFedapay($phone): string{
-        $phone = $this->validateAndFormatPhone($phone);
-        if (!$phone) {
-            throw new \Exception('Numéro de téléphone invalide');
-        }
-        
-        if (strlen($phone) !== 11) {
-            throw new \Exception('Numéro de téléphone doit être 229 suivi de 8 chiffres');
-        }
-        
-        return '+' . $phone;
-    }
 
     /**
      * Créer des votes à partir d'un paiement
