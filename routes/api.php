@@ -69,7 +69,7 @@ Route::middleware(['api'])->group(function () {
         Route::get('/payments/history', [PaymentController::class, 'paymentHistory']);
         
         // Webhook
-        Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->name('payment.webhook')->withoutMiddleware(['api', 'throttle']);
+        Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->name('payment.webhook')->withoutMiddleware(['api']);
     });
 
 // Routes publiques pour les redirections
