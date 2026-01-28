@@ -26,10 +26,6 @@ class PaymentController extends Controller
      * Initialiser un paiement
      */
     public function initiatePayment(Request $request): JsonResponse {
-        // NOTE: On n'utilise pas DB::beginTransaction() ici car Payment::create() 
-        // ne nécessite pas de transaction complexe
-        // Si on en a besoin plus tard, on l'ajoutera avec un try-catch approprié
-        
         try {
             $validator = Validator::make($request->all(), [
                 'candidat_id' => 'required|exists:users,id',
@@ -62,43 +58,107 @@ class PaymentController extends Controller
                 ], 422);
             }
 
-            $edition = Edition::findOrFail($data['edition_id']);
+            // Vérifier si l'édition existe SANS utiliser de transactions qui pourraient être corrompues
+            $edition = null;
+            try {
+                // Utiliser une connexion directe pour éviter les problèmes de transaction
+                $edition = DB::table('editions')->find($data['edition_id']);
+                if ($edition) {
+                    $edition = (object) $edition;
+                }
+            } catch (\Exception $e) {
+                Log::error('Erreur lors de la récupération de l\'édition', [
+                    'error' => $e->getMessage(),
+                    'edition_id' => $data['edition_id']
+                ]);
+                
+                // Même si l'édition n'existe pas, on continue et on l'indiquera dans la réponse
+                $edition = null;
+            }
             
-            if (!$edition->isVoteOpen()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Les votes ne sont pas ouverts pour cette édition.'
-                ], 400);
+            // Vérifier si les votes sont ouverts
+            $isVoteOpen = false;
+            $editionName = 'Édition non trouvée';
+            
+            if ($edition) {
+                $editionName = $edition->nom ?? 'Édition';
+                
+                // Convertir les dates en objets Carbon si elles existent
+                $dateDebut = $edition->date_debut_vote ? Carbon::parse($edition->date_debut_vote) : null;
+                $dateFin = $edition->date_fin_vote ? Carbon::parse($edition->date_fin_vote) : null;
+                
+                $now = Carbon::now();
+                if ($dateDebut && $dateFin) {
+                    $isVoteOpen = $now->between($dateDebut, $dateFin);
+                } else {
+                    // Si les dates ne sont pas définies, on considère que les votes sont fermés
+                    $isVoteOpen = false;
+                }
             }
 
-            $candidat = User::findOrFail($data['candidat_id']);
+            // Récupérer le candidat
+            $candidat = null;
+            try {
+                $candidat = DB::table('users')->find($data['candidat_id']);
+                if ($candidat) {
+                    $candidat = (object) $candidat;
+                }
+            } catch (\Exception $e) {
+                Log::error('Erreur lors de la récupération du candidat', [
+                    'error' => $e->getMessage(),
+                    'candidat_id' => $data['candidat_id']
+                ]);
+            }
             
-            $category = null;
-            if ($data['category_id']) {
-                $category = Category::findOrFail($data['category_id']);
-                
-                $candidature = Candidature::where('candidat_id', $data['candidat_id'])
-                    ->where('edition_id', $data['edition_id'])
-                    ->where('category_id', $data['category_id'])
-                    ->first();
+            if (!$candidat) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Candidat non trouvé'
+                ], 404);
+            }
 
-                if (!$candidature) {
-                    return response()->json([
-                        'success' => false,
-                        'message' => 'Ce candidat ne participe pas à cette catégorie.'
-                    ], 400);
+            $category = null;
+            $categoryName = 'Non spécifiée';
+            
+            if (!empty($data['category_id'])) {
+                try {
+                    $category = DB::table('categories')->find($data['category_id']);
+                    if ($category) {
+                        $category = (object) $category;
+                        $categoryName = $category->nom ?? 'Non spécifiée';
+                        
+                        // Vérifier la candidature
+                        $candidature = DB::table('candidatures')
+                            ->where('candidat_id', $data['candidat_id'])
+                            ->where('edition_id', $data['edition_id'])
+                            ->where('category_id', $data['category_id'])
+                            ->first();
+                            
+                        if (!$candidature) {
+                            return response()->json([
+                                'success' => false,
+                                'message' => 'Ce candidat ne participe pas à cette catégorie.'
+                            ], 400);
+                        }
+                    }
+                } catch (\Exception $e) {
+                    Log::error('Erreur lors de la récupération de la catégorie', [
+                        'error' => $e->getMessage(),
+                        'category_id' => $data['category_id']
+                    ]);
                 }
             }
 
             $amount = $this->votePrice * $data['votes_count'];
+            $candidatName = ($candidat->nom_complet ?? $candidat->nom ?? '') . ' ' . ($candidat->prenoms ?? '');
 
-            // Création simple sans transaction
-            $payment = Payment::create([
+            // Création du paiement
+            $paymentData = [
                 'reference' => 'VOTE-' . strtoupper(Str::random(10)),
                 'user_id' => null,
                 'edition_id' => $data['edition_id'],
                 'candidat_id' => $data['candidat_id'],
-                'category_id' => $data['category_id'] ?? null,
+                'category_id' => !empty($data['category_id']) ? $data['category_id'] : null,
                 'transaction_id' => null,
                 'amount' => $amount,
                 'montant' => $amount,
@@ -114,36 +174,62 @@ class PaymentController extends Controller
                 'metadata' => [
                     'votes_count' => $data['votes_count'],
                     'vote_price' => $this->votePrice,
-                    'candidat_name' => $candidat->nom_complet ?? $candidat->nom . ' ' . $candidat->prenoms,
-                    'edition_name' => $edition->nom,
-                    'category_name' => $category->nom ?? 'Non spécifiée',
+                    'candidat_name' => $candidatName,
+                    'edition_name' => $editionName,
+                    'category_name' => $categoryName,
+                    'is_vote_open' => $isVoteOpen,
                     'ip_address' => $request->ip(),
                     'user_agent' => $request->userAgent(),
                     'created_at' => Carbon::now()->toISOString()
                 ],
-                'expires_at' => Carbon::now()->addMinutes(30)
-            ]);
+                'expires_at' => Carbon::now()->addMinutes(30),
+                'created_at' => Carbon::now(),
+                'updated_at' => Carbon::now()
+            ];
 
-            return response()->json([
+            // Insertion directe sans Eloquent pour éviter les problèmes de transaction
+            try {
+                $paymentId = DB::table('payments')->insertGetId($paymentData);
+                $paymentData['id'] = $paymentId;
+            } catch (\Exception $e) {
+                Log::error('Erreur lors de la création du paiement', [
+                    'error' => $e->getMessage(),
+                    'payment_data' => $paymentData
+                ]);
+                
+                throw $e;
+            }
+
+            $responseData = [
                 'success' => true,
                 'message' => 'Paiement initialisé avec succès',
                 'data' => [
-                    'payment_token' => $payment->payment_token,
+                    'payment_token' => $paymentData['payment_token'],
                     'amount' => $amount,
                     'currency' => 'XOF',
                     'votes_count' => $data['votes_count'],
-                    'candidat_name' => $candidat->nom_complet ?? $candidat->nom . ' ' . $candidat->prenoms,
-                    'edition_name' => $edition->nom,
-                    'category_name' => $category->nom ?? 'Non spécifiée',
-                    'expires_at' => $payment->expires_at->toISOString(),
-                    'check_status_url' => url("/api/payments/{$payment->payment_token}/status"),
-                    'success_url' => url("/payments/{$payment->payment_token}/success/redirect"),
-                    'failed_url' => url("/payments/{$payment->payment_token}/failed/redirect")
+                    'candidat_name' => $candidatName,
+                    'edition_name' => $editionName,
+                    'category_name' => $categoryName,
+                    'is_vote_open' => $isVoteOpen,
+                    'expires_at' => Carbon::parse($paymentData['expires_at'])->toISOString(),
+                    'check_status_url' => url("/api/payments/{$paymentData['payment_token']}/status"),
+                    'success_url' => url("/payments/{$paymentData['payment_token']}/success/redirect"),
+                    'failed_url' => url("/payments/{$paymentData['payment_token']}/failed/redirect")
                 ]
-            ]);
+            ];
 
-        } 
-        catch (\Exception $e) {
+            // Ajouter un avertissement si les votes ne sont pas ouverts
+            if (!$isVoteOpen && $edition) {
+                $responseData['warning'] = 'Les votes ne sont actuellement pas ouverts pour cette édition. Vous pouvez toujours procéder au paiement, mais les votes ne seront comptabilisés que si les votes sont ouverts au moment du traitement.';
+                $responseData['data']['vote_status'] = 'closed';
+            } else if ($isVoteOpen) {
+                $responseData['data']['vote_status'] = 'open';
+            }
+
+            return response()->json($responseData);
+
+        } catch (\Exception $e) {
             Log::error('Erreur initiation paiement', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
@@ -161,7 +247,6 @@ class PaymentController extends Controller
      * Traiter le paiement
      */
     public function processPayment(Request $request): JsonResponse{
-        // Pas de transaction ici car processFedaPayPayment ne fait pas d'opérations critiques
         try {
             $validator = Validator::make($request->all(), [
                 'payment_token' => 'required|exists:payments,payment_token',
@@ -175,7 +260,10 @@ class PaymentController extends Controller
                 ], 422);
             }
 
-            $payment = Payment::where('payment_token', $request->payment_token)->first();
+            // Récupérer le paiement directement sans Eloquent
+            $payment = DB::table('payments')
+                ->where('payment_token', $request->payment_token)
+                ->first();
             
             if (!$payment) {
                 return response()->json([
@@ -183,6 +271,10 @@ class PaymentController extends Controller
                     'message' => 'Paiement non trouvé'
                 ], 404);
             }
+            
+            // Convertir en objet
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
 
             // Vérifier les statuts qui permettent de retenter le paiement
             $allowedStatuses = ['pending', 'processing', 'failed', 'cancelled', 'expired'];
@@ -195,32 +287,47 @@ class PaymentController extends Controller
             }
 
             // Vérifier si le paiement a expiré
-            if ($payment->expires_at && $payment->expires_at->isPast()) {
-                $payment->update(['status' => 'expired']);
+            if ($payment->expires_at && Carbon::parse($payment->expires_at)->isPast()) {
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update(['status' => 'expired']);
+                    
                 return response()->json([
                     'success' => false,
                     'message' => 'Le paiement a expiré'
                 ], 400);
             }
 
-            $edition = Edition::find($payment->edition_id);
-            if (!$edition || !$edition->isVoteOpen()) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Les votes ne sont plus ouverts pour cette édition'
-                ], 400);
+            // Vérifier si l'édition existe toujours et si les votes sont ouverts
+            $isVoteOpen = false;
+            try {
+                $edition = DB::table('editions')->find($payment->edition_id);
+                if ($edition) {
+                    $dateDebut = $edition->date_debut_vote ? Carbon::parse($edition->date_debut_vote) : null;
+                    $dateFin = $edition->date_fin_vote ? Carbon::parse($edition->date_fin_vote) : null;
+                    
+                    $now = Carbon::now();
+                    if ($dateDebut && $dateFin) {
+                        $isVoteOpen = $now->between($dateDebut, $dateFin);
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning('Erreur vérification ouverture votes', [
+                    'error' => $e->getMessage(),
+                    'edition_id' => $payment->edition_id
+                ]);
+                // On continue même si la vérification échoue
             }
 
             // Si le paiement était annulé ou échoué, le réinitialiser
             if (in_array($payment->status, ['cancelled', 'failed', 'expired'])) {
-                // Conserver certaines métadonnées importantes
-                $metadata = $payment->metadata ?? [];
                 $importantMetadata = [
                     'votes_count' => $metadata['votes_count'] ?? 1,
                     'vote_price' => $metadata['vote_price'] ?? $this->votePrice,
                     'candidat_name' => $metadata['candidat_name'] ?? '',
                     'edition_name' => $metadata['edition_name'] ?? '',
                     'category_name' => $metadata['category_name'] ?? '',
+                    'is_vote_open' => $isVoteOpen,
                     'ip_address' => $metadata['ip_address'] ?? null,
                     'user_agent' => $metadata['user_agent'] ?? null,
                     'created_at' => $metadata['created_at'] ?? Carbon::now()->toISOString(),
@@ -229,13 +336,19 @@ class PaymentController extends Controller
                     'retry_at' => Carbon::now()->toISOString()
                 ];
                 
-                $payment->update([
-                    'status' => 'pending',
-                    'transaction_id' => null,
-                    'payment_method' => null,
-                    'metadata' => $importantMetadata,
-                    'expires_at' => Carbon::now()->addMinutes(30)
-                ]);
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update([
+                        'status' => 'pending',
+                        'transaction_id' => null,
+                        'payment_method' => null,
+                        'metadata' => json_encode($importantMetadata),
+                        'expires_at' => Carbon::now()->addMinutes(30),
+                        'updated_at' => Carbon::now()
+                    ]);
+                    
+                $payment->status = 'pending';
+                $metadata = $importantMetadata;
             }
 
             return $this->processFedaPayPayment($payment, $request->payment_method);
@@ -257,7 +370,7 @@ class PaymentController extends Controller
     /**
      * Traiter un paiement FedaPay
      */
-    private function processFedaPayPayment(Payment $payment, string $paymentMethod): JsonResponse {
+    private function processFedaPayPayment($payment, string $paymentMethod): JsonResponse {
         try {
             $apiKey = config('services.fedapay.secret_key');
             $environment = config('services.fedapay.environment', 'live');
@@ -284,13 +397,15 @@ class PaymentController extends Controller
                 }
             }
 
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            
             $transactionData = [
                 'description' => sprintf(
                     'Vote pour %s (%d vote%s) - %s',
-                    $payment->metadata['candidat_name'] ?? 'Candidat',
-                    $payment->metadata['votes_count'] ?? 1,
-                    $payment->metadata['votes_count'] > 1 ? 's' : '',
-                    $payment->metadata['edition_name'] ?? 'Édition'
+                    $metadata['candidat_name'] ?? 'Candidat',
+                    $metadata['votes_count'] ?? 1,
+                    $metadata['votes_count'] > 1 ? 's' : '',
+                    $metadata['edition_name'] ?? 'Édition'
                 ),
                 'amount' => (int) $payment->amount,
                 'currency' => ['iso' => 'XOF'],
@@ -340,18 +455,23 @@ class PaymentController extends Controller
                     : "https://process.fedapay.com/{$transaction['payment_token']}";
             }
 
-            // Mettre à jour le paiement SANS transaction pour éviter les problèmes
-            $payment->update([
-                'transaction_id' => $transactionId,
-                'payment_method' => $paymentMethod,
-                'status' => 'processing',
-                'metadata' => array_merge($payment->metadata ?? [], [
-                    'fedapay_transaction_id' => $transactionId,
-                    'fedapay_payment_token' => $transaction['payment_token'] ?? null,
-                    'processed_at' => Carbon::now()->toISOString(),
-                    'payment_url' => $paymentUrl
-                ])
+            // Mettre à jour le paiement
+            $metadata = array_merge($metadata, [
+                'fedapay_transaction_id' => $transactionId,
+                'fedapay_payment_token' => $transaction['payment_token'] ?? null,
+                'processed_at' => Carbon::now()->toISOString(),
+                'payment_url' => $paymentUrl
             ]);
+            
+            DB::table('payments')
+                ->where('id', $payment->id)
+                ->update([
+                    'transaction_id' => $transactionId,
+                    'payment_method' => $paymentMethod,
+                    'status' => 'processing',
+                    'metadata' => json_encode($metadata),
+                    'updated_at' => Carbon::now()
+                ]);
 
             return response()->json([
                 'success' => true,
@@ -361,7 +481,7 @@ class PaymentController extends Controller
                     'transaction_id' => $transactionId,
                     'payment_token' => $payment->payment_token,
                     'payment_method' => $paymentMethod,
-                    'expires_at' => $payment->expires_at?->toISOString(),
+                    'expires_at' => Carbon::parse($payment->expires_at)->toISOString(),
                     'check_status_url' => url("/api/payments/{$payment->payment_token}/status"),
                     'success_redirect_url' => url("/payments/{$payment->payment_token}/success/redirect"),
                     'failed_redirect_url' => url("/payments/{$payment->payment_token}/failed/redirect")
@@ -386,19 +506,40 @@ class PaymentController extends Controller
      */
     public function checkPaymentStatus($token): JsonResponse{
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
             
+            if (!$payment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé'
+                ], 404);
+            }
+            
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
+
             // Synchroniser avec FedaPay si nécessaire
             if ($payment->transaction_id && in_array($payment->status, ['pending', 'processing'])) {
                 $this->syncPaymentStatusWithFedapay($payment);
-                $payment->refresh();
+                // Recharger les données
+                $payment = DB::table('payments')
+                    ->where('payment_token', $token)
+                    ->first();
+                if ($payment) {
+                    $payment = (object) $payment;
+                    $metadata = json_decode($payment->metadata, true) ?? [];
+                }
             }
 
             // Vérifier l'expiration
-            $isExpired = $payment->expires_at && $payment->expires_at->isPast();
+            $isExpired = $payment->expires_at && Carbon::parse($payment->expires_at)->isPast();
             if ($isExpired && $payment->status === 'pending') {
-                $payment->update(['status' => 'expired']);
-                $payment->refresh();
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update(['status' => 'expired']);
+                $payment->status = 'expired';
             }
 
             return response()->json([
@@ -408,10 +549,10 @@ class PaymentController extends Controller
                     'is_successful' => in_array($payment->status, ['approved', 'completed', 'paid', 'success']),
                     'is_expired' => $isExpired,
                     'amount' => $payment->amount,
-                    'votes_count' => $payment->metadata['votes_count'] ?? 1,
-                    'candidat_name' => $payment->metadata['candidat_name'] ?? '',
-                    'created_at' => $payment->created_at->toISOString(),
-                    'paid_at' => $payment->paid_at?->toISOString(),
+                    'votes_count' => $metadata['votes_count'] ?? 1,
+                    'candidat_name' => $metadata['candidat_name'] ?? '',
+                    'created_at' => Carbon::parse($payment->created_at)->toISOString(),
+                    'paid_at' => $payment->paid_at ? Carbon::parse($payment->paid_at)->toISOString() : null,
                     'payment_method' => $payment->payment_method,
                     'transaction_id' => $payment->transaction_id,
                     'reference' => $payment->reference,
@@ -455,7 +596,19 @@ class PaymentController extends Controller
      */
     public function paymentSuccess($token): JsonResponse{
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
+            
+            if (!$payment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé'
+                ], 404);
+            }
+            
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
 
             if (!in_array($payment->status, ['approved', 'completed', 'paid', 'success'])) {
                 return response()->json([
@@ -473,15 +626,15 @@ class PaymentController extends Controller
                         'reference' => $payment->reference,
                         'amount' => $payment->amount,
                         'currency' => $payment->currency,
-                        'paid_at' => $payment->paid_at?->format('d/m/Y H:i'),
+                        'paid_at' => $payment->paid_at ? Carbon::parse($payment->paid_at)->format('d/m/Y H:i') : null,
                         'payment_method' => $payment->payment_method,
                         'status' => $payment->status
                     ],
                     'vote_details' => [
-                        'votes_count' => $payment->metadata['votes_count'] ?? 1,
-                        'candidat_name' => $payment->metadata['candidat_name'] ?? '',
-                        'edition_name' => $payment->metadata['edition_name'] ?? '',
-                        'category_name' => $payment->metadata['category_name'] ?? ''
+                        'votes_count' => $metadata['votes_count'] ?? 1,
+                        'candidat_name' => $metadata['candidat_name'] ?? '',
+                        'edition_name' => $metadata['edition_name'] ?? '',
+                        'category_name' => $metadata['category_name'] ?? ''
                     ]
                 ]
             ]);
@@ -505,9 +658,15 @@ class PaymentController extends Controller
     public function redirectSuccess($token)
     {
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
             
-            $html = $this->generateAutoClosePage($payment, 'success');
+            if (!$payment) {
+                return $this->generateAutoClosePage(null, 'error');
+            }
+            
+            $html = $this->generateAutoClosePage((object) $payment, 'success');
             
             return response($html)->header('Content-Type', 'text/html');
 
@@ -527,7 +686,18 @@ class PaymentController extends Controller
     public function paymentFailed($token): JsonResponse
     {
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
+            
+            if (!$payment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé'
+                ], 404);
+            }
+            
+            $payment = (object) $payment;
 
             return response()->json([
                 'success' => false,
@@ -535,7 +705,7 @@ class PaymentController extends Controller
                 'data' => [
                     'status' => $payment->status,
                     'can_retry' => in_array($payment->status, ['failed', 'cancelled', 'expired']),
-                    'expires_at' => $payment->expires_at?->format('d/m/Y H:i'),
+                    'expires_at' => $payment->expires_at ? Carbon::parse($payment->expires_at)->format('d/m/Y H:i') : null,
                     'amount' => $payment->amount,
                     'payment_token' => $payment->payment_token,
                     'reference' => $payment->reference
@@ -561,9 +731,15 @@ class PaymentController extends Controller
     public function redirectFailed($token)
     {
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
             
-            $html = $this->generateAutoClosePage($payment, 'failed');
+            if (!$payment) {
+                return $this->generateAutoClosePage(null, 'error');
+            }
+            
+            $html = $this->generateAutoClosePage((object) $payment, 'failed');
             
             return response($html)->header('Content-Type', 'text/html');
 
@@ -622,35 +798,64 @@ class PaymentController extends Controller
     }
 
     /**
-     * CRITIQUE: Cette méthode provoquait l'erreur SQLSTATE[25P02]
-     * Elle est maintenant sécurisée avec gestion transactionnelle complète
+     * Créer des votes à partir d'un paiement
      */
-    private function createVotesFromPayment(Payment $payment): bool {
-        // Pas de transaction ici - chaque opération est atomique
+    private function createVotesFromPayment($payment): bool {
         try {
-            $votesCount = $payment->metadata['votes_count'] ?? 1;
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            $votesCount = $metadata['votes_count'] ?? 1;
             
-            // Chercher d'abord la candidature sans transaction
-            $candidature = Candidature::where('candidat_id', $payment->candidat_id)
+            // Vérifier si les votes sont ouverts
+            $isVoteOpen = $metadata['is_vote_open'] ?? false;
+            
+            // Si les votes ne sont pas ouverts, on ne crée pas de votes mais on garde le paiement comme réussi
+            if (!$isVoteOpen) {
+                Log::info('Votes non créés car fermés', [
+                    'payment_id' => $payment->id,
+                    'edition_id' => $payment->edition_id
+                ]);
+                
+                // Marquer dans les métadonnées que les votes n'ont pas été créés
+                $metadata['votes_not_created_reason'] = 'votes_closed';
+                $metadata['votes_created_at'] = null;
+                
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update([
+                        'metadata' => json_encode($metadata),
+                        'updated_at' => Carbon::now()
+                    ]);
+                    
+                return true; // Le paiement est toujours réussi
+            }
+
+            // Chercher la candidature
+            $candidature = DB::table('candidatures')
+                ->where('candidat_id', $payment->candidat_id)
                 ->where('edition_id', $payment->edition_id)
                 ->where('category_id', $payment->category_id)
                 ->first();
             
             if (!$candidature) {
                 // Créer la candidature si elle n'existe pas
-                $candidature = Candidature::create([
+                $candidatureId = DB::table('candidatures')->insertGetId([
                     'candidat_id' => $payment->candidat_id,
                     'edition_id' => $payment->edition_id,
                     'category_id' => $payment->category_id,
                     'nombre_votes' => 0,
-                    'status' => 'active'
+                    'status' => 'active',
+                    'created_at' => Carbon::now(),
+                    'updated_at' => Carbon::now()
                 ]);
+                $candidature = (object) ['id' => $candidatureId];
+            } else {
+                $candidature = (object) $candidature;
             }
 
-            // Créer les votes un par un - plus sûr qu'une boucle avec transaction
+            // Créer les votes
             $votesCreated = 0;
             for ($i = 0; $i < $votesCount; $i++) {
-                Vote::create([
+                DB::table('votes')->insert([
                     'edition_id' => $payment->edition_id,
                     'candidat_id' => $payment->candidat_id,
                     'votant_id' => $payment->user_id,
@@ -661,23 +866,43 @@ class PaymentController extends Controller
                     'amount' => $this->votePrice,
                     'customer_email' => $payment->customer_email,
                     'customer_phone' => $payment->customer_phone,
-                    'ip_address' => $payment->metadata['ip_address'] ?? null,
-                    'user_agent' => $payment->metadata['user_agent'] ?? null,
-                    'created_at' => Carbon::now()
+                    'ip_address' => $metadata['ip_address'] ?? null,
+                    'user_agent' => $metadata['user_agent'] ?? null,
+                    'created_at' => Carbon::now(),
+                    'updated_at' => Carbon::now()
                 ]);
                 $votesCreated++;
             }
 
             // Mettre à jour le compteur de votes
             if ($votesCreated > 0) {
-                $candidature->increment('nombre_votes', $votesCreated);
+                DB::table('candidatures')
+                    ->where('id', $candidature->id)
+                    ->increment('nombre_votes', $votesCreated);
             }
+
+            // Mettre à jour les métadonnées
+            $metadata['votes_created'] = $votesCreated;
+            $metadata['votes_created_at'] = Carbon::now()->toISOString();
+            
+            DB::table('payments')
+                ->where('id', $payment->id)
+                ->update([
+                    'metadata' => json_encode($metadata),
+                    'updated_at' => Carbon::now()
+                ]);
+
+            Log::info('Votes créés avec succès', [
+                'payment_id' => $payment->id,
+                'votes_created' => $votesCreated,
+                'candidature_id' => $candidature->id
+            ]);
 
             return true;
 
         } catch (\Exception $e) {
             Log::error('Erreur création des votes', [
-                'payment_id' => $payment->id,
+                'payment_id' => $payment->id ?? 'N/A',
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
@@ -691,17 +916,29 @@ class PaymentController extends Controller
      */
     public function verifyPayment($token): JsonResponse{
         try {
-            $payment = Payment::where('payment_token', $token)->firstOrFail();
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
+                ->first();
             
+            if (!$payment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé'
+                ], 404);
+            }
+            
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
+
             return response()->json([
                 'success' => true,
                 'data' => [
                     'exists' => true,
                     'status' => $payment->status,
                     'amount' => $payment->amount,
-                    'expires_at' => $payment->expires_at?->toISOString(),
-                    'candidat_name' => $payment->metadata['candidat_name'] ?? '',
-                    'votes_count' => $payment->metadata['votes_count'] ?? 1
+                    'expires_at' => $payment->expires_at ? Carbon::parse($payment->expires_at)->toISOString() : null,
+                    'candidat_name' => $metadata['candidat_name'] ?? '',
+                    'votes_count' => $metadata['votes_count'] ?? 1
                 ]
             ]);
 
@@ -717,13 +954,22 @@ class PaymentController extends Controller
      * Annuler un paiement
      */
     public function cancelPayment($token): JsonResponse{
-        // Pas de transaction - simple update
         try {
-            $payment = Payment::where('payment_token', $token)
+            $payment = DB::table('payments')
+                ->where('payment_token', $token)
                 ->where('status', 'pending')
-                ->firstOrFail();
+                ->first();
+            
+            if (!$payment) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé ou non annulable'
+                ], 404);
+            }
 
-            $payment->update(['status' => 'cancelled']);
+            DB::table('payments')
+                ->where('id', $payment->id)
+                ->update(['status' => 'cancelled']);
 
             return response()->json([
                 'success' => true,
@@ -757,8 +1003,11 @@ class PaymentController extends Controller
                 ], 401);
             }
 
-            $payments = Payment::where('customer_email', $user->email)
-                ->orWhere('email_payeur', $user->email)
+            $payments = DB::table('payments')
+                ->where(function($query) use ($user) {
+                    $query->where('customer_email', $user->email)
+                          ->orWhere('email_payeur', $user->email);
+                })
                 ->orderBy('created_at', 'desc')
                 ->paginate(10);
 
@@ -823,7 +1072,7 @@ class PaymentController extends Controller
     /**
      * Générer une page HTML qui ferme automatiquement la fenêtre
      */
-    private function generateAutoClosePage(?Payment $payment, string $type, string $message = ''): \Illuminate\Http\Response{
+    private function generateAutoClosePage(?object $payment, string $type, string $message = ''): \Illuminate\Http\Response{
         $config = [
             'success' => [
                 'title' => 'Paiement Réussi',
@@ -874,16 +1123,17 @@ class PaymentController extends Controller
         $paymentDetailsHtml = '';
 
         if ($payment) {
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            $votes = $metadata['votes_count'] ?? 1;
+            
             $paymentData = [
                 'token' => $payment->payment_token,
                 'status' => $payment->status,
                 'reference' => $payment->reference,
                 'amount' => $payment->amount,
-                'candidat_name' => $payment->metadata['candidat_name'] ?? '',
-                'votes_count' => $payment->metadata['votes_count'] ?? 1
+                'candidat_name' => $metadata['candidat_name'] ?? '',
+                'votes_count' => $votes
             ];
-
-            $votes = $payment->metadata['votes_count'] ?? 1;
 
             $paymentDetailsHtml = '
             <div class="payment-details animate-slide-up">
@@ -899,7 +1149,7 @@ class PaymentController extends Controller
                     </div>
                     <div class="detail-item">
                         <span class="detail-label">Candidat</span>
-                        <span class="detail-value">' . htmlspecialchars($payment->metadata['candidat_name'] ?? '', ENT_QUOTES, 'UTF-8') . '</span>
+                        <span class="detail-value">' . htmlspecialchars($metadata['candidat_name'] ?? '', ENT_QUOTES, 'UTF-8') . '</span>
                     </div>
                     <div class="detail-item">
                         <span class="detail-label">Votes</span>
@@ -1373,12 +1623,17 @@ HTML;
             }
 
             // Chercher le paiement
-            $payment = Payment::where('transaction_id', $transactionId)->first();
+            $payment = DB::table('payments')
+                ->where('transaction_id', $transactionId)
+                ->first();
             
             if (!$payment) {
                 Log::warning('Paiement non trouvé pour webhook POST', ['transaction_id' => $transactionId]);
                 return response()->json(['success' => false, 'message' => 'Paiement non trouvé'], 404);
             }
+            
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
 
             // Mettre à jour le statut selon l'événement
             switch ($event) {
@@ -1406,31 +1661,34 @@ HTML;
 
             if ($newStatus !== $payment->status) {
                 // Mise à jour sans transaction
-                $payment->update([
-                    'status' => $newStatus,
-                    'metadata' => array_merge($payment->metadata ?? [], [
-                        'webhook_received_at' => Carbon::now()->toISOString(),
-                        'webhook_event' => $event,
-                        'webhook_method' => 'POST',
-                        'webhook_data' => $data
-                    ])
+                $metadata = array_merge($metadata, [
+                    'webhook_received_at' => Carbon::now()->toISOString(),
+                    'webhook_event' => $event,
+                    'webhook_method' => 'POST',
+                    'webhook_data' => $data
                 ]);
                 
-                // Si le paiement est réussi, créer les votes SANS transaction
+                $updateData = [
+                    'status' => $newStatus,
+                    'metadata' => json_encode($metadata),
+                    'updated_at' => Carbon::now()
+                ];
+                
+                // Si le paiement est réussi, marquer la date de paiement
+                if (in_array($newStatus, ['approved', 'completed', 'paid', 'success'])) {
+                    $updateData['paid_at'] = Carbon::now();
+                }
+                
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update($updateData);
+                
+                // Si le paiement est réussi, créer les votes
                 if (in_array($newStatus, ['approved', 'completed', 'paid', 'success']) && 
                     !in_array($payment->status, ['approved', 'completed', 'paid', 'success'])) {
                     
-                    $payment->paid_at = Carbon::now();
-                    $payment->save();
-                    
                     // Appel SÉCURISÉ qui ne provoque pas d'erreur transaction
-                    $votesCreated = $this->createVotesFromPayment($payment);
-                    
-                    if (!$votesCreated) {
-                        Log::error('Échec création votes après paiement réussi', [
-                            'payment_id' => $payment->id
-                        ]);
-                    }
+                    $this->createVotesFromPayment($payment);
                 }
                 
                 Log::info('Statut paiement mis à jour via webhook POST', [
@@ -1479,7 +1737,9 @@ HTML;
             }
 
             // Chercher le paiement
-            $payment = Payment::where('transaction_id', $transactionId)->first();
+            $payment = DB::table('payments')
+                ->where('transaction_id', $transactionId)
+                ->first();
             
             if (!$payment) {
                 Log::warning('Paiement non trouvé pour redirection GET', [
@@ -1487,6 +1747,9 @@ HTML;
                 ]);
                 return $this->generateAutoClosePage(null, 'error', 'Paiement non trouvé');
             }
+            
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
 
             // Déterminer le statut
             $isCancelled = ($status === 'pending' && $close === 'true') || 
@@ -1495,18 +1758,23 @@ HTML;
                         str_contains(strtolower($request->fullUrl()), 'cancel');
 
             if ($isCancelled) {
-                // Mettre à jour le statut comme annulé SANS transaction
-                $payment->update([
-                    'status' => 'cancelled',
-                    'metadata' => array_merge($payment->metadata ?? [], [
-                        'redirect_received_at' => Carbon::now()->toISOString(),
-                        'redirect_status' => $status,
-                        'redirect_close' => $close,
-                        'redirect_url' => $request->fullUrl(),
-                        'cancelled_at' => Carbon::now()->toISOString(),
-                        'cancellation_source' => 'fedapay_redirect'
-                    ])
+                // Mettre à jour le statut comme annulé
+                $metadata = array_merge($metadata, [
+                    'redirect_received_at' => Carbon::now()->toISOString(),
+                    'redirect_status' => $status,
+                    'redirect_close' => $close,
+                    'redirect_url' => $request->fullUrl(),
+                    'cancelled_at' => Carbon::now()->toISOString(),
+                    'cancellation_source' => 'fedapay_redirect'
                 ]);
+                
+                DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->update([
+                        'status' => 'cancelled',
+                        'metadata' => json_encode($metadata),
+                        'updated_at' => Carbon::now()
+                    ]);
                 
                 Log::info('Paiement marqué comme annulé via redirection GET', [
                     'payment_id' => $payment->id,
@@ -1520,7 +1788,17 @@ HTML;
 
             // Si c'est un retour normal, synchroniser avec FedaPay
             $this->syncPaymentStatusWithFedapay($payment);
-            $payment->refresh();
+
+            // Recharger le paiement
+            $payment = DB::table('payments')
+                ->where('id', $payment->id)
+                ->first();
+                
+            if (!$payment) {
+                return $this->generateAutoClosePage(null, 'error', 'Paiement non trouvé après synchronisation');
+            }
+            
+            $payment = (object) $payment;
 
             // Déterminer le type de page à afficher
             if (in_array($payment->status, ['approved', 'completed', 'paid', 'success'])) {
@@ -1542,7 +1820,7 @@ HTML;
     /**
      * Synchroniser le statut avec FedaPay
      */
-    private function syncPaymentStatusWithFedapay(Payment $payment): void
+    private function syncPaymentStatusWithFedapay($payment): void
     {
         try {
             $apiKey = config('services.fedapay.secret_key');
@@ -1570,28 +1848,39 @@ HTML;
                     
                     if ($newStatus !== $payment->status) {
                         // Mise à jour SANS transaction pour éviter les problèmes
-                        $payment->update([
-                            'status' => $newStatus,
-                            'metadata' => array_merge($payment->metadata ?? [], [
-                                'last_sync_at' => Carbon::now()->toISOString(),
-                                'fedapay_sync_status' => $transaction['status']
-                            ])
+                        $metadata = json_decode($payment->metadata, true) ?? [];
+                        $metadata = array_merge($metadata, [
+                            'last_sync_at' => Carbon::now()->toISOString(),
+                            'fedapay_sync_status' => $transaction['status']
                         ]);
                         
-                        // Si le paiement est réussi, créer les votes SANS transaction
+                        $updateData = [
+                            'status' => $newStatus,
+                            'metadata' => json_encode($metadata),
+                            'updated_at' => Carbon::now()
+                        ];
+                        
+                        // Si le paiement est réussi, marquer la date de paiement
+                        if (in_array($newStatus, ['approved', 'completed', 'paid', 'success'])) {
+                            $updateData['paid_at'] = Carbon::now();
+                        }
+                        
+                        DB::table('payments')
+                            ->where('id', $payment->id)
+                            ->update($updateData);
+                        
+                        // Si le paiement est réussi, créer les votes
                         if (in_array($newStatus, ['approved', 'completed', 'paid', 'success']) && 
                             !in_array($payment->status, ['approved', 'completed', 'paid', 'success'])) {
                             
-                            $payment->paid_at = Carbon::now();
-                            $payment->save();
-                            
-                            // Appel SÉCURISÉ sans transaction
-                            $votesCreated = $this->createVotesFromPayment($payment);
-                            
-                            if (!$votesCreated) {
-                                Log::error('Échec création votes après synchronisation', [
-                                    'payment_id' => $payment->id
-                                ]);
+                            // Recharger le paiement pour avoir les données à jour
+                            $updatedPayment = DB::table('payments')
+                                ->where('id', $payment->id)
+                                ->first();
+                                
+                            if ($updatedPayment) {
+                                // Appel SÉCURISÉ sans transaction
+                                $this->createVotesFromPayment((object) $updatedPayment);
                             }
                         }
                         
@@ -1636,11 +1925,15 @@ HTML;
             // Chercher le paiement
             $payment = null;
             if ($paymentToken) {
-                $payment = Payment::where('payment_token', $paymentToken)->first();
+                $payment = DB::table('payments')
+                    ->where('payment_token', $paymentToken)
+                    ->first();
             }
             
             if (!$payment && $transactionId) {
-                $payment = Payment::where('transaction_id', $transactionId)->first();
+                $payment = DB::table('payments')
+                    ->where('transaction_id', $transactionId)
+                    ->first();
             }
 
             if (!$payment) {
@@ -1650,11 +1943,23 @@ HTML;
                 ]);
                 return $this->generateAutoClosePage(null, 'error', 'Paiement non trouvé');
             }
+            
+            $payment = (object) $payment;
 
             // Synchroniser le statut
             if (in_array($payment->status, ['pending', 'processing'])) {
                 $this->syncPaymentStatusWithFedapay($payment);
-                $payment->refresh();
+                // Recharger le paiement
+                $payment = DB::table('payments')
+                    ->where('id', $payment->id)
+                    ->first();
+                if ($payment) {
+                    $payment = (object) $payment;
+                }
+            }
+
+            if (!$payment) {
+                return $this->generateAutoClosePage(null, 'error', 'Paiement non trouvé après synchronisation');
             }
 
             // Déterminer le type de page à afficher
@@ -1683,20 +1988,30 @@ HTML;
         }
         
         try {
-            $payment = Payment::where('payment_token', $paymentToken)->first();
+            $payment = DB::table('payments')
+                ->where('payment_token', $paymentToken)
+                ->first();
             
             if (!$payment) {
                 return $this->generateAutoClosePage(null, 'error', 'Paiement non trouvé');
             }
             
-            // Mettre à jour le statut SANS transaction
-            $payment->update([
-                'status' => 'cancelled',
-                'metadata' => array_merge($payment->metadata ?? [], [
-                    'callback_cancelled_at' => Carbon::now()->toISOString(),
-                    'callback_url' => $request->fullUrl()
-                ])
+            $payment = (object) $payment;
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            
+            // Mettre à jour le statut
+            $metadata = array_merge($metadata, [
+                'callback_cancelled_at' => Carbon::now()->toISOString(),
+                'callback_url' => $request->fullUrl()
             ]);
+            
+            DB::table('payments')
+                ->where('id', $payment->id)
+                ->update([
+                    'status' => 'cancelled',
+                    'metadata' => json_encode($metadata),
+                    'updated_at' => Carbon::now()
+                ]);
             
             Log::info('Paiement annulé via callback URL', [
                 'payment_id' => $payment->id,
