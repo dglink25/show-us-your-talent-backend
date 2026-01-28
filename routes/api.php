@@ -52,25 +52,25 @@ Route::middleware(['api', 'throttle:60,1'])->group(function () {
     Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->name('payment.webhook');
 });
 
-Route::middleware(['api', 'throttle:30,1'])->group(function () {
-    // Votes
-    Route::post('/votes', [VoteController::class, 'vote'])->name('vote.create');
-    Route::get('/votes/history', [VoteController::class, 'voteHistory']);
-    Route::get('/votes/statistics', [VoteController::class, 'getUserStatistics']);
-    
-    // Paiements
-    Route::post('/payments/initiate', [PaymentController::class, 'initiatePayment'])->name('payment.initiate');
-    Route::post('/payments/process', [PaymentController::class, 'processPayment'])->name('payment.process');
-    Route::get('/payments/{token}/verify', [PaymentController::class, 'verifyPayment'])->name('payment.verify');
-    Route::get('/payments/{token}/status', [PaymentController::class, 'checkPaymentStatus'])->name('payment.status');
-    Route::get('/payments/{token}/success', [PaymentController::class, 'paymentSuccess'])->name('payment.success');
-    Route::get('/payments/{token}/failed', [PaymentController::class, 'paymentFailed'])->name('payment.failed');
-    Route::post('/payments/{token}/cancel', [PaymentController::class, 'cancelPayment'])->name('payment.cancel');
-    Route::get('/payments/history', [PaymentController::class, 'paymentHistory']);
-    
-    // Webhook
-    Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->name('payment.webhook')->withoutMiddleware(['api', 'throttle']);
-});
+    Route::middleware(['api'])->group(function () {
+        // Votes
+        Route::post('/votes', [VoteController::class, 'vote'])->name('vote.create');
+        Route::get('/votes/history', [VoteController::class, 'voteHistory']);
+        Route::get('/votes/statistics', [VoteController::class, 'getUserStatistics']);
+        
+        // Paiements
+        Route::post('/payments/initiate', [PaymentController::class, 'initiatePayment'])->name('payment.initiate');
+        Route::post('/payments/process', [PaymentController::class, 'processPayment'])->name('payment.process');
+        Route::get('/payments/{token}/verify', [PaymentController::class, 'verifyPayment'])->name('payment.verify');
+        Route::get('/payments/{token}/status', [PaymentController::class, 'checkPaymentStatus'])->name('payment.status');
+        Route::get('/payments/{token}/success', [PaymentController::class, 'paymentSuccess'])->name('payment.success');
+        Route::get('/payments/{token}/failed', [PaymentController::class, 'paymentFailed'])->name('payment.failed');
+        Route::post('/payments/{token}/cancel', [PaymentController::class, 'cancelPayment'])->name('payment.cancel');
+        Route::get('/payments/history', [PaymentController::class, 'paymentHistory']);
+        
+        // Webhook
+        Route::post('/payments/webhook', [PaymentController::class, 'webhook'])->name('payment.webhook')->withoutMiddleware(['api', 'throttle']);
+    });
 
 // Routes publiques pour les redirections
 Route::middleware('web')->group(function () {
