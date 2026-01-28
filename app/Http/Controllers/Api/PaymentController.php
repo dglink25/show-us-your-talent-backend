@@ -7,7 +7,6 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Http;
 use Carbon\Carbon;
@@ -17,12 +16,15 @@ class PaymentController extends Controller
     private $votePrice = 100;
 
     /**
-     * Initialiser un paiement - Version SANS transactions
+     * Initialiser un paiement - Version FORCÉE sans transaction
      */
     public function initiatePayment(Request $request): JsonResponse {
+        // FORCER la fin de TOUTES les transactions PostgreSQL
+        $this->forceCleanTransactions();
+        
         try {
-            // Validation manuelle SANS utiliser la validation Laravel qui peut créer des transactions
-            $errors = $this->validatePaymentRequest($request);
+            // Validation MANUELLE ultra-légère sans aucun appel à la base
+            $errors = $this->validatePaymentRequestLight($request);
             if (!empty($errors)) {
                 return response()->json([
                     'success' => false,
@@ -33,29 +35,82 @@ class PaymentController extends Controller
 
             $data = $request->all();
             
-            // Valider et formater le téléphone
+            // Valider le téléphone localement
             $phone = $this->validateAndFormatPhone($data['phone']);
             if (!$phone) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Numéro de téléphone invalide',
-                    'errors' => ['phone' => ['Le numéro doit être au format: 0XXXXXXXXX ou 229XXXXXXXX']]
+                    'message' => 'Numéro de téléphone invalide'
                 ], 422);
             }
 
-            // Vérifier si l'édition existe - méthode SANS transaction
-            $edition = $this->getEditionSafely($data['edition_id']);
+            // FORCER une nouvelle connexion propre
+            $connection = $this->getFreshConnection();
             
+            // Vérifier si l'édition existe avec une connexion FORCÉE
+            $editionExists = $this->forceCheckRecordExists($connection, 'editions', $data['edition_id']);
+            
+            if (!$editionExists) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Édition non trouvée'
+                ], 404);
+            }
+
+            // Vérifier le candidat
+            $candidatExists = $this->forceCheckRecordExists($connection, 'users', $data['candidat_id']);
+            
+            if (!$candidatExists) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Candidat non trouvé'
+                ], 404);
+            }
+
+            // Vérifier la catégorie si fournie
+            if (!empty($data['category_id'])) {
+                $categoryExists = $this->forceCheckRecordExists($connection, 'categories', $data['category_id']);
+                
+                if (!$categoryExists) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Catégorie non trouvée'
+                    ], 404);
+                }
+                
+                // Vérifier la candidature
+                $candidatureExists = $this->forceCheckCandidatureExists(
+                    $connection,
+                    $data['candidat_id'],
+                    $data['edition_id'],
+                    $data['category_id']
+                );
+                    
+                if (!$candidatureExists) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Ce candidat ne participe pas à cette catégorie.'
+                    ], 400);
+                }
+            }
+
+            // Récupérer les infos pour le paiement (nom, etc.)
+            $editionInfo = $this->forceGetRecordInfo($connection, 'editions', $data['edition_id'], ['nom', 'date_debut_vote', 'date_fin_vote']);
+            $candidatInfo = $this->forceGetRecordInfo($connection, 'users', $data['candidat_id'], ['nom', 'prenoms', 'nom_complet']);
+            
+            $categoryName = 'Non spécifiée';
+            if (!empty($data['category_id'])) {
+                $categoryInfo = $this->forceGetRecordInfo($connection, 'categories', $data['category_id'], ['nom']);
+                $categoryName = $categoryInfo->nom ?? 'Non spécifiée';
+            }
+
             // Vérifier si les votes sont ouverts
             $isVoteOpen = false;
-            $editionName = 'Édition non trouvée';
+            $editionName = $editionInfo->nom ?? 'Édition';
             
-            if ($edition) {
-                $editionName = $edition->nom ?? 'Édition';
-                
-                // Convertir les dates en objets Carbon si elles existent
-                $dateDebut = $edition->date_debut_vote ? Carbon::parse($edition->date_debut_vote) : null;
-                $dateFin = $edition->date_fin_vote ? Carbon::parse($edition->date_fin_vote) : null;
+            if ($editionInfo) {
+                $dateDebut = $editionInfo->date_debut_vote ? Carbon::parse($editionInfo->date_debut_vote) : null;
+                $dateFin = $editionInfo->date_fin_vote ? Carbon::parse($editionInfo->date_fin_vote) : null;
                 
                 $now = Carbon::now();
                 if ($dateDebut && $dateFin) {
@@ -63,45 +118,11 @@ class PaymentController extends Controller
                 }
             }
 
-            // Récupérer le candidat - méthode SANS transaction
-            $candidat = $this->getCandidatSafely($data['candidat_id']);
-            
-            if (!$candidat) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Candidat non trouvé'
-                ], 404);
-            }
-
-            $category = null;
-            $categoryName = 'Non spécifiée';
-            
-            if (!empty($data['category_id'])) {
-                $category = $this->getCategorySafely($data['category_id']);
-                if ($category) {
-                    $categoryName = $category->nom ?? 'Non spécifiée';
-                    
-                    // Vérifier la candidature SANS transaction
-                    $candidatureExists = $this->checkCandidatureExists(
-                        $data['candidat_id'],
-                        $data['edition_id'],
-                        $data['category_id']
-                    );
-                        
-                    if (!$candidatureExists) {
-                        return response()->json([
-                            'success' => false,
-                            'message' => 'Ce candidat ne participe pas à cette catégorie.'
-                        ], 400);
-                    }
-                }
-            }
-
             $amount = $this->votePrice * $data['votes_count'];
-            $candidatName = ($candidat->nom_complet ?? $candidat->nom ?? '') . ' ' . ($candidat->prenoms ?? '');
+            $candidatName = $candidatInfo->nom_complet ?? ($candidatInfo->nom ?? '') . ' ' . ($candidatInfo->prenoms ?? '');
 
-            // Création du paiement - méthode SANS transaction
-            $paymentData = $this->createPaymentSafely([
+            // Créer le paiement avec connexion FORCÉE
+            $paymentData = $this->forceCreatePayment($connection, [
                 'reference' => 'VOTE-' . strtoupper(Str::random(10)),
                 'user_id' => null,
                 'edition_id' => $data['edition_id'],
@@ -109,14 +130,12 @@ class PaymentController extends Controller
                 'category_id' => !empty($data['category_id']) ? $data['category_id'] : null,
                 'amount' => $amount,
                 'currency' => 'XOF',
-                'status' => 'pending',
                 'payment_token' => Str::uuid(),
                 'customer_email' => $data['email'],
                 'customer_phone' => $phone,
                 'customer_firstname' => $data['firstname'],
                 'customer_lastname' => $data['lastname'],
                 'votes_count' => $data['votes_count'],
-                'vote_price' => $this->votePrice,
                 'candidat_name' => $candidatName,
                 'edition_name' => $editionName,
                 'category_name' => $categoryName,
@@ -128,6 +147,9 @@ class PaymentController extends Controller
             if (!$paymentData) {
                 throw new \Exception('Échec de la création du paiement');
             }
+
+            // Fermer la connexion proprement
+            $this->closeConnection($connection);
 
             $responseData = [
                 'success' => true,
@@ -141,18 +163,18 @@ class PaymentController extends Controller
                     'edition_name' => $editionName,
                     'category_name' => $categoryName,
                     'is_vote_open' => $isVoteOpen,
-                    'expires_at' => Carbon::parse($paymentData['expires_at'])->toISOString(),
+                    'expires_at' => $paymentData['expires_at'],
                     'check_status_url' => url("/api/payments/{$paymentData['payment_token']}/status"),
                     'success_url' => url("/payments/{$paymentData['payment_token']}/success/redirect"),
                     'failed_url' => url("/payments/{$paymentData['payment_token']}/failed/redirect")
                 ]
             ];
 
-            // Ajouter un avertissement si les votes ne sont pas ouverts
-            if (!$isVoteOpen && $edition) {
-                $responseData['warning'] = 'Les votes ne sont actuellement pas ouverts pour cette édition. Vous pouvez toujours procéder au paiement, mais les votes ne seront comptabilisés que si les votes sont ouverts au moment du traitement.';
+            // Avertissement si votes fermés
+            if (!$isVoteOpen) {
+                $responseData['warning'] = 'Les votes ne sont actuellement pas ouverts pour cette édition. Le paiement peut être effectué, mais les votes seront comptabilisés uniquement lorsque les votes seront ouverts.';
                 $responseData['data']['vote_status'] = 'closed';
-            } else if ($isVoteOpen) {
+            } else {
                 $responseData['data']['vote_status'] = 'open';
             }
 
@@ -161,16 +183,482 @@ class PaymentController extends Controller
         } catch (\Exception $e) {
             Log::error('Erreur initiation paiement', [
                 'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-                'request' => $request->all()
+                'trace' => $e->getTraceAsString()
             ]);
 
             return response()->json([
                 'success' => false,
-                'message' => 'Erreur lors de l\'initialisation du paiement: ' . $e->getMessage()
+                'message' => 'Erreur lors de l\'initialisation du paiement'
             ], 500);
         }
     }
+
+    /**
+     * FORCER le nettoyage des transactions PostgreSQL
+     */
+    private function forceCleanTransactions(): void {
+        try {
+            // Obtenir une connexion fraîche
+            $pdo = DB::connection('pgsql')->getPdo();
+            
+            // 1. Rollback de TOUTES les transactions en cours
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            
+            // 2. Exécuter une commande PostgreSQL pour nettoyer
+            $pdo->exec("DISCARD ALL");
+            
+            // 3. Réinitialiser la connexion
+            DB::purge('pgsql');
+            
+            Log::info('Transactions PostgreSQL nettoyées forcément');
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur nettoyage transactions', [
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Obtenir une connexion FRAÎCHE sans transaction
+     */
+    private function getFreshConnection() {
+        try {
+            // Purger la connexion existante
+            DB::purge('pgsql');
+            
+            // Obtenir une nouvelle connexion
+            $connection = DB::connection('pgsql')->getPdo();
+            
+            // S'assurer qu'il n'y a pas de transaction
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            // Désactiver l'auto-commit pour contrôler manuellement
+            $connection->setAttribute(\PDO::ATTR_AUTOCOMMIT, true);
+            
+            return $connection;
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur obtention connexion fraîche', [
+                'error' => $e->getMessage()
+            ]);
+            throw $e;
+        }
+    }
+
+    /**
+     * Fermer une connexion proprement
+     */
+    private function closeConnection($connection): void {
+        try {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            $connection = null;
+        } catch (\Exception $e) {
+            // Ignorer les erreurs de fermeture
+        }
+    }
+
+    /**
+     * Validation ultra-légère sans base de données
+     */
+    private function validatePaymentRequestLight(Request $request): array {
+        $errors = [];
+        $data = $request->all();
+
+        // Validation simple
+        if (empty($data['candidat_id']) || !is_numeric($data['candidat_id'])) {
+            $errors['candidat_id'] = ['Le champ candidat est requis et doit être numérique.'];
+        }
+
+        if (empty($data['edition_id']) || !is_numeric($data['edition_id'])) {
+            $errors['edition_id'] = ['Le champ édition est requis et doit être numérique.'];
+        }
+
+        if (!empty($data['category_id']) && !is_numeric($data['category_id'])) {
+            $errors['category_id'] = ['Le champ catégorie doit être numérique.'];
+        }
+
+        if (empty($data['votes_count']) || !is_numeric($data['votes_count']) || $data['votes_count'] < 1 || $data['votes_count'] > 100) {
+            $errors['votes_count'] = ['Le nombre de votes doit être un nombre entre 1 et 100.'];
+        }
+
+        if (empty($data['email']) || !filter_var($data['email'], FILTER_VALIDATE_EMAIL) || strlen($data['email']) > 100) {
+            $errors['email'] = ['L\'email doit être une adresse valide et ne pas dépasser 100 caractères.'];
+        }
+
+        if (empty($data['phone']) || strlen($data['phone']) < 8 || strlen($data['phone']) > 15) {
+            $errors['phone'] = ['Le téléphone doit avoir entre 8 et 15 caractères.'];
+        }
+
+        if (empty($data['firstname']) || strlen($data['firstname']) > 50) {
+            $errors['firstname'] = ['Le prénom est requis et ne doit pas dépasser 50 caractères.'];
+        }
+
+        if (empty($data['lastname']) || strlen($data['lastname']) > 50) {
+            $errors['lastname'] = ['Le nom est requis et ne doit pas dépasser 50 caractères.'];
+        }
+
+        return $errors;
+    }
+
+    /**
+     * Vérifier si un enregistrement existe avec connexion FORCÉE
+     */
+    private function forceCheckRecordExists($connection, string $table, $id): bool {
+        try {
+            // S'assurer qu'il n'y a pas de transaction
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $stmt = $connection->prepare("SELECT 1 FROM {$table} WHERE id = :id LIMIT 1");
+            $stmt->execute([':id' => $id]);
+            return (bool) $stmt->fetch(\PDO::FETCH_COLUMN);
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur vérification existence', [
+                'table' => $table,
+                'id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Récupérer des infos d'un enregistrement avec connexion FORCÉE
+     */
+    private function forceGetRecordInfo($connection, string $table, $id, array $columns) {
+        try {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $columnsStr = implode(', ', $columns);
+            $stmt = $connection->prepare("SELECT {$columnsStr} FROM {$table} WHERE id = :id LIMIT 1");
+            $stmt->execute([':id' => $id]);
+            return $stmt->fetch(\PDO::FETCH_OBJ);
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur récupération infos', [
+                'table' => $table,
+                'id' => $id,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Vérifier une candidature avec connexion FORCÉE
+     */
+    private function forceCheckCandidatureExists($connection, $candidatId, $editionId, $categoryId): bool {
+        try {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $stmt = $connection->prepare("
+                SELECT 1 FROM candidatures 
+                WHERE candidat_id = :candidat_id 
+                AND edition_id = :edition_id 
+                AND category_id = :category_id 
+                LIMIT 1
+            ");
+            
+            $stmt->execute([
+                ':candidat_id' => $candidatId,
+                ':edition_id' => $editionId,
+                ':category_id' => $categoryId
+            ]);
+            
+            return (bool) $stmt->fetch(\PDO::FETCH_COLUMN);
+            
+        } catch (\Exception $e) {
+            Log::warning('Erreur vérification candidature', [
+                'candidat_id' => $candidatId,
+                'edition_id' => $editionId,
+                'category_id' => $categoryId,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Créer un paiement avec connexion FORCÉE
+     */
+    private function forceCreatePayment($connection, array $data): ?array {
+        try {
+            // S'assurer qu'il n'y a pas de transaction
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $paymentToken = $data['payment_token'] ?? Str::uuid();
+            $metadata = json_encode([
+                'votes_count' => $data['votes_count'],
+                'vote_price' => $this->votePrice,
+                'candidat_name' => $data['candidat_name'],
+                'edition_name' => $data['edition_name'],
+                'category_name' => $data['category_name'],
+                'is_vote_open' => $data['is_vote_open'],
+                'ip_address' => $data['ip_address'],
+                'user_agent' => $data['user_agent'],
+                'created_at' => Carbon::now()->toISOString()
+            ]);
+            
+            $expiresAt = Carbon::now()->addMinutes(30);
+            $now = Carbon::now();
+            
+            $sql = "
+                INSERT INTO payments (
+                    reference, user_id, edition_id, candidat_id, category_id,
+                    transaction_id, amount, montant, currency, status,
+                    payment_token, payment_method, customer_email, email_payeur,
+                    customer_phone, customer_firstname, customer_lastname,
+                    metadata, expires_at, created_at, updated_at
+                ) VALUES (
+                    :reference, :user_id, :edition_id, :candidat_id, :category_id,
+                    :transaction_id, :amount, :montant, :currency, :status,
+                    :payment_token, :payment_method, :customer_email, :email_payeur,
+                    :customer_phone, :customer_firstname, :customer_lastname,
+                    :metadata, :expires_at, :created_at, :updated_at
+                ) RETURNING id, payment_token, expires_at
+            ";
+            
+            $stmt = $connection->prepare($sql);
+            $stmt->execute([
+                ':reference' => $data['reference'],
+                ':user_id' => $data['user_id'],
+                ':edition_id' => $data['edition_id'],
+                ':candidat_id' => $data['candidat_id'],
+                ':category_id' => $data['category_id'],
+                ':transaction_id' => null,
+                ':amount' => $data['amount'],
+                ':montant' => $data['amount'],
+                ':currency' => $data['currency'],
+                ':status' => 'pending',
+                ':payment_token' => $paymentToken,
+                ':payment_method' => null,
+                ':customer_email' => $data['customer_email'],
+                ':email_payeur' => $data['customer_email'],
+                ':customer_phone' => $data['customer_phone'],
+                ':customer_firstname' => $data['customer_firstname'],
+                ':customer_lastname' => $data['customer_lastname'],
+                ':metadata' => $metadata,
+                ':expires_at' => $expiresAt,
+                ':created_at' => $now,
+                ':updated_at' => $now
+            ]);
+            
+            $result = $stmt->fetch(\PDO::FETCH_ASSOC);
+            
+            return [
+                'id' => $result['id'] ?? null,
+                'payment_token' => $result['payment_token'] ?? $paymentToken,
+                'expires_at' => $result['expires_at'] ?? $expiresAt->toISOString()
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur création paiement', [
+                'error' => $e->getMessage(),
+                'data_keys' => array_keys($data)
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Valider et formater le téléphone (inchangé)
+     */
+    private function validateAndFormatPhone($phone): ?string {
+        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+        
+        if (empty($cleanPhone) || strlen($cleanPhone) < 8) {
+            return null;
+        }
+
+        if (str_starts_with($cleanPhone, '0') && strlen($cleanPhone) === 10) {
+            return '229' . substr($cleanPhone, 1);
+        }
+
+        if (str_starts_with($cleanPhone, '229')) {
+            if (strlen($cleanPhone) === 11) {
+                return $cleanPhone;
+            }
+            if (strlen($cleanPhone) > 11) {
+                return substr($cleanPhone, 0, 11);
+            }
+        }
+
+        if (strlen($cleanPhone) >= 8 && strlen($cleanPhone) <= 9) {
+            $base = substr($cleanPhone, 0, 8);
+            return '229' . $base;
+        }
+
+        return null;
+    }
+
+    /**
+     * Pour les autres méthodes, utiliser le même pattern
+     * 1. forceCleanTransactions() au début
+     * 2. getFreshConnection() pour chaque opération
+     * 3. closeConnection() à la fin
+     */
+    
+    /**
+     * Vérifier le statut du paiement
+     */
+    public function checkPaymentStatus($token): JsonResponse{
+        $this->forceCleanTransactions();
+        $connection = $this->getFreshConnection();
+        
+        try {
+            $payment = $this->forceGetPaymentByToken($connection, $token);
+            
+            if (!$payment) {
+                $this->closeConnection($connection);
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Paiement non trouvé'
+                ], 404);
+            }
+            
+            $metadata = json_decode($payment->metadata, true) ?? [];
+            
+            // Vérifier l'expiration
+            $isExpired = $payment->expires_at && Carbon::parse($payment->expires_at)->isPast();
+            if ($isExpired && $payment->status === 'pending') {
+                $this->forceUpdatePaymentStatus($connection, $payment->id, 'expired');
+                $payment->status = 'expired';
+            }
+            
+            $this->closeConnection($connection);
+            
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'status' => $payment->status,
+                    'is_successful' => in_array($payment->status, ['approved', 'completed', 'paid', 'success']),
+                    'is_expired' => $isExpired,
+                    'amount' => $payment->amount,
+                    'votes_count' => $metadata['votes_count'] ?? 1,
+                    'candidat_name' => $metadata['candidat_name'] ?? '',
+                    'created_at' => Carbon::parse($payment->created_at)->toISOString(),
+                    'paid_at' => $payment->paid_at ? Carbon::parse($payment->paid_at)->toISOString() : null,
+                    'payment_method' => $payment->payment_method,
+                    'transaction_id' => $payment->transaction_id,
+                    'reference' => $payment->reference,
+                    'payment_token' => $payment->payment_token,
+                    'check_interval' => 3000
+                ]
+            ]);
+
+        } catch (\Exception $e) {
+            $this->closeConnection($connection);
+            Log::error('Erreur vérification statut paiement', [
+                'token' => $token,
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la vérification du statut'
+            ], 500);
+        }
+    }
+    
+    /**
+     * Récupérer un paiement par token
+     */
+    private function forceGetPaymentByToken($connection, string $token) {
+        try {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $stmt = $connection->prepare("SELECT * FROM payments WHERE payment_token = :token LIMIT 1");
+            $stmt->execute([':token' => $token]);
+            return $stmt->fetch(\PDO::FETCH_OBJ);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur récupération paiement', [
+                'token' => $token,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+    
+    /**
+     * Mettre à jour le statut d'un paiement
+     */
+    private function forceUpdatePaymentStatus($connection, $paymentId, $status): bool {
+        try {
+            if ($connection->inTransaction()) {
+                $connection->rollBack();
+            }
+            
+            $stmt = $connection->prepare("
+                UPDATE payments 
+                SET status = :status, updated_at = :updated_at 
+                WHERE id = :id
+            ");
+            
+            return $stmt->execute([
+                ':status' => $status,
+                ':updated_at' => Carbon::now(),
+                ':id' => $paymentId
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur mise à jour statut', [
+                'payment_id' => $paymentId,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * REDÉMARRER COMPLÈTEMENT la connexion PostgreSQL
+     * À exécuter MANUELLEMENT si l'erreur persiste
+     */
+    public function resetPostgresConnection(): JsonResponse {
+        try {
+            // 1. Fermer toutes les connexions existantes
+            DB::disconnect('pgsql');
+            
+            // 2. Purger complètement
+            DB::purge('pgsql');
+            
+            // 3. Recréer la connexion
+            DB::reconnect('pgsql');
+            
+            // 4. Exécuter une requête de test
+            $test = DB::select('SELECT 1 as test');
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Connexion PostgreSQL redémarrée avec succès',
+                'test' => $test
+            ]);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Échec du redémarrage: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
 
     /**
      * Validation manuelle SANS transaction
@@ -761,36 +1249,6 @@ class PaymentController extends Controller
         }
     }
 
-    /**
-     * Méthodes auxiliaires (inchangées)
-     */
-    private function validateAndFormatPhone($phone): ?string {
-        $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
-        
-        if (empty($cleanPhone) || strlen($cleanPhone) < 8) {
-            return null;
-        }
-
-        if (str_starts_with($cleanPhone, '0') && strlen($cleanPhone) === 10) {
-            return '229' . substr($cleanPhone, 1);
-        }
-
-        if (str_starts_with($cleanPhone, '229')) {
-            if (strlen($cleanPhone) === 11) {
-                return $cleanPhone;
-            }
-            if (strlen($cleanPhone) > 11) {
-                return substr($cleanPhone, 0, 11);
-            }
-        }
-
-        if (strlen($cleanPhone) >= 8 && strlen($cleanPhone) <= 9) {
-            $base = substr($cleanPhone, 0, 8);
-            return '229' . $base;
-        }
-
-        return null;
-    }
 
     private function formatPhoneForFedapay($phone): string{
         $phone = $this->validateAndFormatPhone($phone);
@@ -805,79 +1263,6 @@ class PaymentController extends Controller
         return '+' . $phone;
     }
    
-    /**
-     * Vérifier le statut du paiement
-     */
-    public function checkPaymentStatus($token): JsonResponse{
-        try {
-            $payment = DB::table('payments')
-                ->where('payment_token', $token)
-                ->first();
-            
-            if (!$payment) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Paiement non trouvé'
-                ], 404);
-            }
-            
-            $payment = (object) $payment;
-            $metadata = json_decode($payment->metadata, true) ?? [];
-
-            // Synchroniser avec FedaPay si nécessaire
-            if ($payment->transaction_id && in_array($payment->status, ['pending', 'processing'])) {
-                $this->syncPaymentStatusWithFedapay($payment);
-                // Recharger les données
-                $payment = DB::table('payments')
-                    ->where('payment_token', $token)
-                    ->first();
-                if ($payment) {
-                    $payment = (object) $payment;
-                    $metadata = json_decode($payment->metadata, true) ?? [];
-                }
-            }
-
-            // Vérifier l'expiration
-            $isExpired = $payment->expires_at && Carbon::parse($payment->expires_at)->isPast();
-            if ($isExpired && $payment->status === 'pending') {
-                DB::table('payments')
-                    ->where('id', $payment->id)
-                    ->update(['status' => 'expired']);
-                $payment->status = 'expired';
-            }
-
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'status' => $payment->status,
-                    'is_successful' => in_array($payment->status, ['approved', 'completed', 'paid', 'success']),
-                    'is_expired' => $isExpired,
-                    'amount' => $payment->amount,
-                    'votes_count' => $metadata['votes_count'] ?? 1,
-                    'candidat_name' => $metadata['candidat_name'] ?? '',
-                    'created_at' => Carbon::parse($payment->created_at)->toISOString(),
-                    'paid_at' => $payment->paid_at ? Carbon::parse($payment->paid_at)->toISOString() : null,
-                    'payment_method' => $payment->payment_method,
-                    'transaction_id' => $payment->transaction_id,
-                    'reference' => $payment->reference,
-                    'payment_token' => $payment->payment_token,
-                    'check_interval' => 3000
-                ]
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Erreur vérification statut paiement', [
-                'token' => $token,
-                'error' => $e->getMessage()
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur lors de la vérification du statut'
-            ], 500);
-        }
-    }
-
     /**
      * Mapper le statut FedaPay
      */
