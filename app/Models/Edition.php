@@ -70,20 +70,21 @@ class Edition extends Model
                     $this->votes_ouverts = true;
                     $this->statut_votes = 'en_cours';
                 } 
-                elseif ($now->lessThan($this->date_debut_votes)) {
-                    // Votes pas encore commencés
-                    $this->votes_ouverts = false;
-                    $this->statut_votes = 'en_attente';
-                }
+                
                 elseif ($now->greaterThan($this->date_fin_votes)) {
                     // Votes terminés
                     $this->votes_ouverts = false;
                     $this->statut_votes = 'termine';
                 }
+                elseif ($now->lessThan($this->date_debut_votes)) {
+                    // Votes pas encore commencés
+                    $this->votes_ouverts = false;
+                    $this->statut_votes = 'en_attente';
+                }
             } else {
                 // Pas de dates de vote définies
                 $this->votes_ouverts = false;
-                $this->statut_votes = 'en_attente';
+                $this->statut_votes = 'termine';
             }
             
             // Si les inscriptions sont encore ouvertes, on ne peut pas voter
