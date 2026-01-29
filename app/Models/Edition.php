@@ -89,7 +89,7 @@ class Edition extends Model
             // Si les inscriptions sont encore ouvertes, on ne peut pas voter
             if ($this->inscriptions_ouvertes && $this->statut_votes === 'en_cours') {
                 $this->votes_ouverts = false;
-                $this->statut_votes = 'suspendu';
+                $this->statut_votes = 'en_cours';
             }
         } else {
             // Édition inactive
@@ -99,8 +99,7 @@ class Edition extends Model
     }
 
     // Accesseur pour votes_ouverts basé sur les dates (calculé à la volée)
-    public function getVotesOuvertsAutoAttribute()
-    {
+    public function getVotesOuvertsAutoAttribute(){
         if ($this->statut !== 'active') {
             return false;
         }
@@ -132,7 +131,7 @@ class Edition extends Model
         $now = Carbon::now();
         
         if (!$this->date_debut_votes || !$this->date_fin_votes) {
-            return 'non_configuré';
+            return 'termine';
         }
 
         if ($now->lessThan($this->date_debut_votes)) {
@@ -140,7 +139,7 @@ class Edition extends Model
         }
         
         if ($now->between($this->date_debut_votes, $this->date_fin_votes)) {
-            return $this->inscriptions_ouvertes ? 'suspendu' : 'en_cours';
+            return $this->inscriptions_ouvertes ? 'termine' : 'en_cours';
         }
         
         if ($now->greaterThan($this->date_fin_votes)) {
@@ -279,7 +278,7 @@ class Edition extends Model
     public function getPeutConfigurerVotesAttribute()
     {
         return $this->statut === 'active' && 
-               in_array($this->statut_votes, ['en_attente', 'suspendu', 'termine']);
+               in_array($this->statut_votes, ['en_attente', 'termine']);
     }
 
     // Méthode pour vérifier si on peut démarrer les votes
@@ -302,14 +301,14 @@ class Edition extends Model
     // Méthode pour vérifier si on peut relancer les votes
     public function getPeutRelancerVotesAttribute()
     {
-        return $this->est_active && $this->statut_votes === 'suspendu';
+        return $this->est_active && $this->statut_votes === 'termine';
     }
 
     // Méthode pour vérifier si on peut terminer les votes
     public function getPeutTerminerVotesAttribute()
     {
         return $this->est_active && 
-               ($this->statut_votes === 'en_cours' || $this->statut_votes === 'suspendu') &&
+               ($this->statut_votes === 'en_cours' || $this->statut_votes === 'termine') &&
                now()->greaterThanOrEqualTo($this->date_fin_votes);
     }
 
