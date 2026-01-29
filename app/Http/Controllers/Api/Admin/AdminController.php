@@ -20,13 +20,11 @@ use Illuminate\Support\Facades\Log;
 class AdminController extends Controller
 {
     /**
-     * Récupérer les candidats de l'édition active - VERSION CORRIGÉE ET OPTIMISÉE
+     * Récupérer les candidats de l'édition active - VERSION CORRIGÉE
      */
-    public function getCandidatsEditionActive(Request $request)
-    {
-        // Pas de transaction pour les lectures uniquement - évite les erreurs de transaction abortée
+    public function getCandidatsEditionActive(Request $request) {
         try {
-            // 1. Trouver l'édition active avec une requête optimisée
+            // 1. Trouver l'édition active
             $edition = Edition::select('id', 'nom', 'annee', 'numero_edition', 'statut_votes', 
                                      'votes_ouverts', 'inscriptions_ouvertes', 'date_debut_votes', 
                                      'date_fin_votes', 'date_debut_inscriptions', 'date_fin_inscriptions')
@@ -43,6 +41,7 @@ class AdminController extends Controller
                     'categories' => [],
                     'statistiques' => [
                         'total_votes' => 0,
+                        'total_montant' => 0,
                         'total_candidats' => 0,
                         'total_votes_today' => 0,
                         'date_dernier_vote' => null
@@ -57,7 +56,7 @@ class AdminController extends Controller
                 ->orderBy('ordre_affichage')
                 ->get();
             
-            // 3. Récupérer les candidatures valides en une seule requête
+            // 3. Récupérer les candidatures valides
             $candidatures = Candidature::select('id', 'candidat_id', 'category_id', 'video_url', 'nombre_votes')
                 ->where('edition_id', $edition->id)
                 ->where('statut', 'validee')
@@ -67,7 +66,7 @@ class AdminController extends Controller
                 ->get()
                 ->groupBy('category_id');
             
-            // 4. Calculer les statistiques (requêtes séparées pour plus de clarté)
+            // 4. Calculer les statistiques
             $stats = $this->calculateStatistics($edition->id);
             
             // 5. Calculer les votes de l'utilisateur
@@ -78,12 +77,19 @@ class AdminController extends Controller
             // 6. Préparer les données de l'édition
             $editionData = $this->prepareEditionData($edition);
             
-            // 7. Préparer les données des catégories
-            $categoriesData = $categories->map(function($category) use ($candidatures, $userVotes) {
+            // 7. Calculer les votes réels pour chaque candidat et préparer les catégories
+            $categoriesData = $categories->map(function($category) use ($candidatures, $userVotes, $edition) {
                 $categoryCandidatures = $candidatures->get($category->id, collect());
                 
-                $candidats = $categoryCandidatures->map(function($candidature) use ($category, $userVotes) {
+                $candidats = $categoryCandidatures->map(function($candidature) use ($category, $userVotes, $edition) {
                     if (!$candidature->candidat) return null;
+                    
+                    // Calculer les votes réels pour ce candidat
+                    $votesData = $this->calculateVotesForCandidat(
+                        $candidature->candidat_id,
+                        $candidature->category_id,
+                        $edition->id
+                    );
                     
                     return [
                         'id' => $candidature->candidat->id,
@@ -98,14 +104,19 @@ class AdminController extends Controller
                         'universite' => $candidature->candidat->universite,
                         'filiere' => $candidature->candidat->filiere,
                         'video_url' => $candidature->video_url,
-                        'nombre_votes' => (int)($candidature->nombre_votes ?? 0),
+                        'nombre_votes' => $votesData['total_votes'], // Utiliser les votes réels
+                        'total_montant' => $votesData['total_montant'], // Montant total des votes
                         'a_deja_vote' => isset($userVotes[$candidature->candidat_id]),
                         'categorie_id' => $candidature->category_id,
                         'categorie_nom' => $category->nom,
                     ];
                 })->filter()->values();
                 
+                // Trier par nombre de votes décroissant
+                $candidats = $candidats->sortByDesc('nombre_votes')->values();
+                
                 $totalVotesCategorie = $candidats->sum('nombre_votes');
+                $totalMontantCategorie = $candidats->sum('total_montant');
                 
                 return [
                     'id' => $category->id,
@@ -114,6 +125,7 @@ class AdminController extends Controller
                     'ordre_affichage' => $category->ordre_affichage,
                     'candidats' => $candidats,
                     'total_votes_categorie' => $totalVotesCategorie,
+                    'total_montant_categorie' => $totalMontantCategorie,
                     'total_candidats_categorie' => $candidats->count(),
                 ];
             });
@@ -137,21 +149,67 @@ class AdminController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * Calculer les votes d'un candidat dans une catégorie
+     */
+    private function calculateVotesForCandidat($candidatId, $categoryId, $editionId) {
+        try {
+            $payments = Payment::where('edition_id', $editionId)
+                ->where('candidat_id', $candidatId)
+                ->where('category_id', $categoryId)
+                ->where('status', 'approved')
+                ->get();
+            
+            $totalVotes = $payments->sum(function($payment) {
+                $fees = $payment->fees;
+                return isset($fees) ? (int)$fees : 0;
+            });
+            
+            $totalMontant = $payments->sum(function($payment) {
+                return $payment->montant ?? $payment->amount ?? 0;
+            });
+            
+            $totalFees = $payments->sum('fees');
+            
+            return [
+                'total_votes' => $totalVotes,
+                'total_montant' => $totalMontant,
+                'total_fees' => $totalFees
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur calcul votes candidat: ' . $e->getMessage());
+            return [
+                'total_votes' => 0,
+                'total_montant' => 0,
+                'total_fees' => 0
+            ];
+        }
+    }
     
     /**
-     * Calculer les statistiques - VERSION CORRIGÉE
+     * Calculer les statistiques globales
      */
-    private function calculateStatistics($editionId)
-    {
+    private function calculateStatistics($editionId)  {
         try {
-            // Utiliser des requêtes séparées pour éviter les problèmes de transaction
-            
-            // Total des votes (payments approved)
-            $totalVotes = Payment::where('edition_id', $editionId)
+            // Récupérer tous les paiements approuvés pour calculer en une seule fois
+            $payments = Payment::where('edition_id', $editionId)
                 ->where('status', 'approved')
-                ->sum(DB::raw('COALESCE(fees, amount / 100)'));
+                ->get();
             
-            // Nombre de candidats uniques
+            // Calculer le nombre total de votes
+            $totalVotes = $payments->sum(function($payment) {
+                $fees = $payment->fees;
+                return isset($fees) ? (int)$fees : 0;
+            });
+            
+            // Calculer le montant total
+            $totalMontant = $payments->sum(function($payment) {
+                return $payment->montant ?? $payment->amount ?? 0;
+            });
+            
+            // Nombre de candidats uniques avec candidatures validées
             $totalCandidats = Candidature::where('edition_id', $editionId)
                 ->where('statut', 'validee')
                 ->distinct('candidat_id')
@@ -159,10 +217,15 @@ class AdminController extends Controller
             
             // Votes d'aujourd'hui
             $today = Carbon::today();
-            $totalVotesToday = Payment::where('edition_id', $editionId)
+            $paymentsToday = Payment::where('edition_id', $editionId)
                 ->where('status', 'approved')
                 ->whereDate('created_at', $today)
-                ->sum(DB::raw('COALESCE(fees, amount / 100)'));
+                ->get();
+            
+            $totalVotesToday = $paymentsToday->sum(function($payment) {
+                $fees = $payment->fees;
+                return isset($fees) ? (int)$fees : 0;;
+            });
             
             // Date du dernier vote
             $lastVote = Payment::where('edition_id', $editionId)
@@ -177,6 +240,7 @@ class AdminController extends Controller
             
             return [
                 'total_votes' => (int)$totalVotes,
+                'total_montant' => (float)$totalMontant,
                 'total_candidats' => (int)$totalCandidats,
                 'total_categories' => (int)$totalCategories,
                 'total_votes_today' => (int)$totalVotesToday,
@@ -189,6 +253,7 @@ class AdminController extends Controller
             Log::error('Erreur calcul statistiques: ' . $e->getMessage());
             return [
                 'total_votes' => 0,
+                'total_montant' => 0,
                 'total_candidats' => 0,
                 'total_categories' => 0,
                 'total_votes_today' => 0,
@@ -198,10 +263,9 @@ class AdminController extends Controller
     }
     
     /**
-     * Récupérer les votes de l'utilisateur - VERSION CORRIGÉE
+     * Récupérer les votes de l'utilisateur
      */
-    private function getUserVotes($editionId, $userId)
-    {
+    private function getUserVotes($editionId, $userId)   {
         try {
             $votes = Payment::select('candidat_id')
                 ->where('edition_id', $editionId)
@@ -222,8 +286,7 @@ class AdminController extends Controller
     /**
      * Préparer les données de l'édition
      */
-    private function prepareEditionData(Edition $edition)
-    {
+    private function prepareEditionData(Edition $edition) {
         $now = Carbon::now();
         $tempsRestant = null;
         
@@ -262,8 +325,7 @@ class AdminController extends Controller
     /**
      * Calculer le temps restant
      */
-    private function calculateTimeRemaining($now, $targetDate, $message)
-    {
+    private function calculateTimeRemaining($now, $targetDate, $message) {
         $diff = $now->diff($targetDate);
         
         return [
@@ -279,13 +341,367 @@ class AdminController extends Controller
     /**
      * Obtenir le message selon le statut
      */
-    private function getEditionMessage($statutVotes)
-    {
+    private function getEditionMessage($statutVotes) {
         return match($statutVotes) {
             'en_cours' => 'Édition en cours de vote',
             'en_attente' => 'Votes en attente',
             default => 'Informations sur l\'édition'
         };
+    }
+
+    // Les autres méthodes restent inchangées mais voici les corrections importantes :
+
+    /**
+     * Récupérer les candidats par catégorie - CORRIGÉ
+     */
+    public function getCandidatsByCategory($categoryId){
+        try {
+            $edition = Edition::where('statut', 'active')->first();
+            
+            if (!$edition) {
+                return response()->json([
+                    'success' => true,
+                    'candidats' => []
+                ]);
+            }
+            
+            $candidatures = Candidature::select('id', 'candidat_id', 'category_id', 'video_url')
+                ->where('category_id', $categoryId)
+                ->where('edition_id', $edition->id)
+                ->where('statut', 'validee')
+                ->with(['candidat' => function($query) {
+                    $query->select('id', 'nom', 'prenoms', 'sexe', 'photo_url', 'ethnie', 
+                                 'universite', 'filiere');
+                }])
+                ->get();
+            
+            $candidats = $candidatures->map(function($candidature) use ($edition) {
+                if (!$candidature->candidat) return null;
+                
+                // Calculer les votes réels pour ce candidat
+                $votesData = $this->calculateVotesForCandidat(
+                    $candidature->candidat_id,
+                    $candidature->category_id,
+                    $edition->id
+                );
+                
+                return [
+                    'id' => $candidature->candidat->id,
+                    'nom' => $candidature->candidat->nom,
+                    'prenoms' => $candidature->candidat->prenoms,
+                    'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom,
+                    'sexe' => $candidature->candidat->sexe,
+                    'photo_url' => $candidature->candidat->photo_url,
+                    'ethnie' => $candidature->candidat->ethnie,
+                    'universite' => $candidature->candidat->universite,
+                    'filiere' => $candidature->candidat->filiere,
+                    'video_url' => $candidature->video_url,
+                    'nombre_votes' => $votesData['total_votes'], // Votes réels
+                    'total_montant' => $votesData['total_montant'], // Montant total
+                    'candidature_id' => $candidature->id,
+                    'categorie_id' => $candidature->category_id,
+                ];
+            })->filter()
+              ->sortByDesc('nombre_votes')
+              ->values();
+            
+            return response()->json([
+                'success' => true,
+                'candidats' => $candidats
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Erreur récupération candidats par catégorie: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Rechercher des candidats - CORRIGÉ
+     */
+    public function search(Request $request) {
+        try {
+            $searchTerm = $request->get('q', '');
+            
+            if (empty($searchTerm)) {
+                return response()->json([
+                    'success' => true,
+                    'candidats' => []
+                ]);
+            }
+
+            $edition = Edition::where('statut', 'active')->first();
+            
+            if (!$edition) {
+                return response()->json([
+                    'success' => true,
+                    'candidats' => []
+                ]);
+            }
+
+            $candidats = User::select('id', 'nom', 'prenoms', 'sexe', 'photo_url', 'ethnie', 
+                                    'universite', 'filiere')
+                ->where('type_compte', 'candidat')
+                ->where(function($query) use ($searchTerm) {
+                    $query->where('nom', 'LIKE', "%{$searchTerm}%")
+                          ->orWhere('prenoms', 'LIKE', "%{$searchTerm}%")
+                          ->orWhere('universite', 'LIKE', "%{$searchTerm}%")
+                          ->orWhere('filiere', 'LIKE', "%{$searchTerm}%");
+                })
+                ->whereHas('candidatures', function($query) use ($edition) {
+                    $query->where('edition_id', $edition->id)
+                          ->where('statut', 'validee');
+                })
+                ->with(['candidatures' => function($query) use ($edition) {
+                    $query->where('edition_id', $edition->id)
+                          ->where('statut', 'validee')
+                          ->with('category:id,nom')
+                          ->first();
+                }])
+                ->limit(20)
+                ->get();
+
+            $result = $candidats->map(function($candidat) use ($edition) {
+                $candidatureActive = $candidat->candidatures->first();
+                
+                if (!$candidatureActive) return null;
+                
+                // Calculer les votes réels pour ce candidat
+                $votesData = $this->calculateVotesForCandidat(
+                    $candidat->id,
+                    $candidatureActive->category_id,
+                    $edition->id
+                );
+                
+                return [
+                    'id' => $candidat->id,
+                    'nom' => $candidat->nom,
+                    'prenoms' => $candidat->prenoms,
+                    'nom_complet' => $candidat->prenoms . ' ' . $candidat->nom,
+                    'sexe' => $candidat->sexe,
+                    'photo_url' => $candidat->photo_url,
+                    'ethnie' => $candidat->ethnie,
+                    'universite' => $candidat->universite,
+                    'filiere' => $candidat->filiere,
+                    'video_url' => $candidatureActive->video_url,
+                    'nombre_votes' => $votesData['total_votes'],
+                    'total_montant' => $votesData['total_montant'],
+                    'categorie_nom' => $candidatureActive->category->nom ?? null,
+                ];
+            })->filter()->values();
+
+            return response()->json([
+                'success' => true,
+                'candidats' => $result
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Erreur recherche candidats: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Récupérer les statistiques de vote - CORRIGÉ
+     */
+    public function getStatistiquesVote(Request $request) {
+        try {
+            $edition = Edition::where('statut', 'active')->first();
+            
+            if (!$edition) {
+                return response()->json([
+                    'success' => true,
+                    'statistiques' => [
+                        'total_votes' => 0,
+                        'total_montant' => 0,
+                        'votes_par_categorie' => [],
+                        'top_candidats' => [],
+                    ]
+                ]);
+            }
+            
+            // Récupérer toutes les catégories
+            $categories = Category::where('edition_id', $edition->id)
+                ->where('active', true)
+                ->get();
+            
+            // Calculer les votes par catégorie
+            $votesParCategorie = $categories->map(function($category) use ($edition) {
+                // Récupérer tous les paiements pour cette catégorie
+                $payments = Payment::where('edition_id', $edition->id)
+                    ->where('category_id', $category->id)
+                    ->where('status', 'approved')
+                    ->get();
+                
+                $totalVotes = $payments->sum(function($payment) {
+                    $metadata = json_decode($payment->metadata, true);
+                    return isset($metadata['votes_count']) ? (int)$metadata['votes_count'] : 0;
+                });
+                
+                $totalMontant = $payments->sum(function($payment) {
+                    return $payment->montant ?? $payment->amount ?? 0;
+                });
+                
+                return [
+                    'id' => $category->id,
+                    'nom' => $category->nom,
+                    'total_votes' => $totalVotes,
+                    'total_montant' => $totalMontant,
+                ];
+            });
+            
+            // Top 10 candidats (par nombre de votes)
+            $topCandidats = [];
+            
+            // Récupérer toutes les candidatures valides
+            $candidatures = Candidature::where('edition_id', $edition->id)
+                ->where('statut', 'validee')
+                ->with(['candidat:id,nom,prenoms'])
+                ->get();
+            
+            foreach ($candidatures as $candidature) {
+                $votesData = $this->calculateVotesForCandidat(
+                    $candidature->candidat_id,
+                    $candidature->category_id,
+                    $edition->id
+                );
+                
+                $topCandidats[] = [
+                    'candidat_id' => $candidature->candidat_id,
+                    'candidature_id' => $candidature->id,
+                    'votes' => $votesData['total_votes'],
+                    'montant' => $votesData['total_montant'],
+                    'candidat' => $candidature->candidat ? [
+                        'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom
+                    ] : null,
+                    'categorie_id' => $candidature->category_id,
+                ];
+            }
+            
+            // Trier par nombre de votes décroissant
+            usort($topCandidats, function($a, $b) {
+                return $b['votes'] <=> $a['votes'];
+            });
+            
+            // Limiter aux 10 premiers
+            $topCandidats = array_slice($topCandidats, 0, 10);
+            
+            // Statistiques globales
+            $stats = $this->calculateStatistics($edition->id);
+            
+            return response()->json([
+                'success' => true,
+                'statistiques' => [
+                    'total_votes' => $stats['total_votes'],
+                    'total_montant' => $stats['total_montant'],
+                    'votes_par_categorie' => $votesParCategorie,
+                    'top_candidats' => $topCandidats,
+                ]
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur statistiques vote: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur serveur'
+            ], 500);
+        }
+    }
+    
+    /**
+     * Récupérer les résultats publics - CORRIGÉ
+     */
+    public function getResultatsPublic($editionId){
+        try {
+            $edition = Edition::select('id', 'nom', 'annee', 'statut_votes')
+                ->find($editionId);
+            
+            if (!$edition) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Édition non trouvée'
+                ], 404);
+            }
+            
+            $categories = Category::select('id', 'nom')
+                ->where('edition_id', $edition->id)
+                ->where('active', true)
+                ->with(['candidatures' => function($query) use ($edition) {
+                    $query->where('edition_id', $edition->id)
+                        ->where('statut', 'validee')
+                        ->with(['candidat:id,nom,prenoms,sexe,photo_url,ethnie,universite,filiere']);
+                }])
+                ->orderBy('ordre_affichage')
+                ->get();
+            
+            // Calculer le total des votes pour l'édition
+            $stats = $this->calculateStatistics($edition->id);
+            $totalVotesEdition = $stats['total_votes'];
+            
+            $categoriesData = $categories->map(function($categorie) use ($edition, $totalVotesEdition) {
+                $candidats = $categorie->candidatures->map(function($candidature) use ($edition, $totalVotesEdition) {
+                    if (!$candidature->candidat) return null;
+                    
+                    // Calculer les votes réels pour ce candidat
+                    $votesData = $this->calculateVotesForCandidat(
+                        $candidature->candidat_id,
+                        $candidature->category_id,
+                        $edition->id
+                    );
+                    
+                    $nombreVotes = $votesData['total_votes'];
+                    $pourcentage = $totalVotesEdition > 0 
+                        ? round(($nombreVotes / $totalVotesEdition) * 100, 2) 
+                        : 0;
+                    
+                    return [
+                        'id' => $candidature->candidat->id,
+                        'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom,
+                        'sexe' => $candidature->candidat->sexe,
+                        'photo' => $candidature->candidat->photo_url,
+                        'ethnie' => $candidature->candidat->ethnie,
+                        'universite' => $candidature->candidat->universite,
+                        'filiere' => $candidature->candidat->filiere,
+                        'nombre_votes' => $nombreVotes,
+                        'total_montant' => $votesData['total_montant'],
+                        'pourcentage' => $pourcentage,
+                        'candidature_id' => $candidature->id,
+                    ];
+                })->filter()
+                  ->sortByDesc('nombre_votes')
+                  ->values();
+                
+                return [
+                    'id' => $categorie->id,
+                    'nom' => $categorie->nom,
+                    'candidats' => $candidats,
+                    'total_candidats' => $candidats->count(),
+                    'total_votes_categorie' => $candidats->sum('nombre_votes'),
+                    'total_montant_categorie' => $candidats->sum('total_montant'),
+                ];
+            });
+            
+            return response()->json([
+                'success' => true,
+                'edition' => $edition,
+                'statistiques' => [
+                    'total_votes' => $totalVotesEdition,
+                    'total_montant' => $stats['total_montant'],
+                ],
+                'categories' => $categoriesData,
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur résultats publics: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur serveur'
+            ], 500);
+        }
     }
 
     /**
@@ -511,131 +927,6 @@ class AdminController extends Controller
             ], 500);
         }
     }
-
-    /**
-     * Récupérer les candidats par catégorie
-     */
-    public function getCandidatsByCategory($categoryId){
-        try {
-            $candidatures = Candidature::select('id', 'candidat_id', 'video_url')
-                ->where('categorie_id', $categoryId)
-                ->whereHas('edition', function($query) {
-                    $query->where('statut', 'active');
-                })
-                ->where('statut', 'validee')
-                ->with(['candidat' => function($query) {
-                    $query->select('id', 'nom', 'prenoms', 'sexe', 'photo_url', 'ethnie', 
-                                 'universite', 'filiere');
-                }])
-                ->withCount('votes')
-                ->orderByDesc('votes_count')
-                ->get();
-
-            $candidats = $candidatures->map(function($candidature) {
-                if (!$candidature->candidat) return null;
-                
-                return [
-                    'id' => $candidature->candidat->id,
-                    'nom' => $candidature->candidat->nom,
-                    'prenoms' => $candidature->candidat->prenoms,
-                    'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom,
-                    'sexe' => $candidature->candidat->sexe,
-                    'photo_url' => $candidature->candidat->photo_url,
-                    'ethnie' => $candidature->candidat->ethnie,
-                    'universite' => $candidature->candidat->universite,
-                    'filiere' => $candidature->candidat->filiere,
-                    'video_url' => $candidature->video_url,
-                    'nombre_votes' => $candidature->votes_count,
-                    'candidature_id' => $candidature->id,
-                    'categorie_id' => $candidature->categorie_id,
-                ];
-            })->filter()->values();
-
-            return response()->json([
-                'success' => true,
-                'candidats' => $candidats
-            ]);
-        } catch (\Exception $e) {
-            Log::error('Erreur récupération candidats par catégorie: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur serveur'
-            ], 500);
-        }
-    }
-
-    /**
-     * Rechercher des candidats
-     */
-    public function search(Request $request)
-    {
-        try {
-            $searchTerm = $request->get('q', '');
-            
-            if (empty($searchTerm)) {
-                return response()->json([
-                    'success' => true,
-                    'candidats' => []
-                ]);
-            }
-
-            $candidats = User::select('id', 'nom', 'prenoms', 'sexe', 'photo_url', 'ethnie', 
-                                    'universite', 'filiere')
-                ->where('type_compte', 'candidat')
-                ->where(function($query) use ($searchTerm) {
-                    $query->where('nom', 'LIKE', "%{$searchTerm}%")
-                          ->orWhere('prenoms', 'LIKE', "%{$searchTerm}%")
-                          ->orWhere('universite', 'LIKE', "%{$searchTerm}%")
-                          ->orWhere('filiere', 'LIKE', "%{$searchTerm}%");
-                })
-                ->whereHas('candidatures', function($query) {
-                    $query->whereHas('edition', function($q) {
-                        $q->where('statut', 'active');
-                    })
-                    ->where('statut', 'validee');
-                })
-                ->with(['candidatures' => function($query) {
-                    $query->whereHas('edition', function($q) {
-                        $q->where('statut', 'active');
-                    })
-                    ->with('category:id,nom')
-                    ->withCount('votes')
-                    ->limit(1);
-                }])
-                ->limit(20)
-                ->get();
-
-            $result = $candidats->map(function($candidat) {
-                $candidatureActive = $candidat->candidatures->first();
-                
-                return [
-                    'id' => $candidat->id,
-                    'nom' => $candidat->nom,
-                    'prenoms' => $candidat->prenoms,
-                    'nom_complet' => $candidat->prenoms . ' ' . $candidat->nom,
-                    'sexe' => $candidat->sexe,
-                    'photo_url' => $candidat->photo_url,
-                    'ethnie' => $candidat->ethnie,
-                    'universite' => $candidat->universite,
-                    'filiere' => $candidat->filiere,
-                    'video_url' => $candidatureActive ? $candidatureActive->video_url : null,
-                    'nombre_votes' => $candidatureActive ? $candidatureActive->votes_count : 0,
-                    'categorie_nom' => $candidatureActive ? $candidatureActive->category->nom : null,
-                ];
-            });
-
-            return response()->json([
-                'success' => true,
-                'candidats' => $result
-            ]);
-        } catch (\Exception $e) {
-            Log::error('Erreur recherche candidats: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur serveur'
-            ], 500);
-        }
-    }
     
     /**
      * Voter pour un candidat avec transaction robuste
@@ -776,147 +1067,4 @@ class AdminController extends Controller
         }
     }
     
-    /**
-     * Récupérer les statistiques de vote
-     */
-    public function getStatistiquesVote(Request $request)
-    {
-        try {
-            $edition = Edition::where('statut', 'active')
-                ->first();
-            
-            if (!$edition) {
-                return response()->json([
-                    'success' => true,
-                    'statistiques' => [
-                        'total_votes' => 0,
-                        'votes_par_categorie' => [],
-                        'top_candidats' => [],
-                    ]
-                ]);
-            }
-            
-            // Utiliser des requêtes optimisées
-            $totalVotes = Vote::where('edition_id', $edition->id)->count();
-            
-            $votesParCategorie = Category::select('categories.id', 'categories.nom', 
-                DB::raw('COUNT(votes.id) as total'))
-                ->leftJoin('votes', function($join) use ($edition) {
-                    $join->on('categories.id', '=', 'votes.categorie_id')
-                         ->where('votes.edition_id', $edition->id);
-                })
-                ->where('categories.edition_id', $edition->id)
-                ->where('categories.active', true)
-                ->groupBy('categories.id', 'categories.nom')
-                ->get();
-            
-            // Top 5 candidats
-            $topCandidats = Vote::select('candidat_id', DB::raw('COUNT(*) as votes'))
-                ->where('edition_id', $edition->id)
-                ->groupBy('candidat_id')
-                ->orderBy('votes', 'desc')
-                ->limit(5)
-                ->with(['candidat:id,nom,prenoms'])
-                ->get()
-                ->map(function($vote) {
-                    return [
-                        'candidat_id' => $vote->candidat_id,
-                        'votes' => $vote->votes,
-                        'candidat' => $vote->candidat ? [
-                            'nom_complet' => $vote->candidat->prenoms . ' ' . $vote->candidat->nom
-                        ] : null
-                    ];
-                });
-            
-            return response()->json([
-                'success' => true,
-                'statistiques' => [
-                    'total_votes' => $totalVotes,
-                    'votes_par_categorie' => $votesParCategorie,
-                    'top_candidats' => $topCandidats,
-                ]
-            ]);
-            
-        } catch (\Exception $e) {
-            Log::error('Erreur statistiques vote: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur serveur'
-            ], 500);
-        }
-    }
-    
-    /**
-     * Récupérer les résultats publics
-     */
-    public function getResultatsPublic($editionId){
-        try {
-            $edition = Edition::select('id', 'nom', 'annee', 'statut_votes')
-                ->find($editionId);
-            
-            if (!$edition) {
-                return response()->json([
-                    'success' => false,
-                    'message' => 'Édition non trouvée'
-                ], 404);
-            }
-            
-            $categories = Category::select('id', 'nom')
-                ->where('edition_id', $edition->id)
-                ->where('active', true)
-                ->with(['candidatures' => function($query) use ($edition) {
-                    $query->where('edition_id', $edition->id)
-                        ->where('statut', 'validee')
-                        ->with(['candidat:id,nom,prenoms,sexe,photo_url,ethnie,universite,filiere'])
-                        ->withCount('votes')
-                        ->orderBy('votes_count', 'desc');
-                }])
-                ->orderBy('ordre_affichage')
-                ->get();
-            
-            $totalVotes = Vote::where('edition_id', $edition->id)->count();
-            
-            $categoriesData = $categories->map(function($categorie) use ($totalVotes) {
-                $candidats = $categorie->candidatures->map(function($candidature) use ($totalVotes) {
-                    if (!$candidature->candidat) return null;
-                    
-                    return [
-                        'id' => $candidature->candidat->id,
-                        'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom,
-                        'sexe' => $candidature->candidat->sexe,
-                        'photo' => $candidature->candidat->photo_url,
-                        'ethnie' => $candidature->candidat->ethnie,
-                        'universite' => $candidature->candidat->universite,
-                        'filiere' => $candidature->candidat->filiere,
-                        'nombre_votes' => $candidature->votes_count ?? 0,
-                        'pourcentage' => $totalVotes > 0 
-                            ? round(($candidature->votes_count / $totalVotes) * 100, 2) 
-                            : 0,
-                    ];
-                })->filter()->values();
-                
-                return [
-                    'id' => $categorie->id,
-                    'nom' => $categorie->nom,
-                    'candidats' => $candidats,
-                ];
-            });
-            
-            return response()->json([
-                'success' => true,
-                'edition' => $edition,
-                'statistiques' => [
-                    'total_votes' => $totalVotes,
-                ],
-                'categories' => $categoriesData,
-            ]);
-            
-        } catch (\Exception $e) {
-            Log::error('Erreur résultats publics: ' . $e->getMessage());
-            return response()->json([
-                'success' => false,
-                'message' => 'Erreur serveur'
-            ], 500);
-        }
-    }
 }
