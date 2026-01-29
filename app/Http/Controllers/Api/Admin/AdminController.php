@@ -26,8 +26,8 @@ class AdminController extends Controller
         try {
             // 1. Trouver l'édition active
             $edition = Edition::select('id', 'nom', 'annee', 'numero_edition', 'statut_votes', 
-                                    'votes_ouverts', 'inscriptions_ouvertes', 'date_debut_votes', 
-                                    'date_fin_votes', 'date_debut_inscriptions', 'date_fin_inscriptions')
+                                     'votes_ouverts', 'inscriptions_ouvertes', 'date_debut_votes', 
+                                     'date_fin_votes', 'date_debut_inscriptions', 'date_fin_inscriptions')
                 ->where('statut', 'active')
                 ->whereIn('statut_votes', ['en_cours', 'en_attente', 'termine'])
                 ->latest('created_at')
@@ -48,12 +48,6 @@ class AdminController extends Controller
                     ]
                 ], 200);
             }
-            
-            // VÉRIFICATION ET MISE À JOUR AUTOMATIQUE DU STATUT DES VOTES
-            $this->verifierEtMettreAJourStatutEdition($edition);
-            
-            // Recharger l'édition pour avoir les données à jour
-            $edition->refresh();
             
             // 2. Récupérer les catégories
             $categories = Category::select('id', 'nom', 'description', 'ordre_affichage')
@@ -153,125 +147,6 @@ class AdminController extends Controller
                 'success' => false,
                 'message' => 'Erreur serveur lors de la récupération des candidats'
             ], 500);
-        }
-    }
-
-    /**
-     * Vérifier et mettre à jour automatiquement le statut de l'édition
-     */
-    private function verifierEtMettreAJourStatutEdition(Edition $edition): bool
-    {
-        try {
-            $now = Carbon::now();
-            $hasChanged = false;
-            
-            // Sauvegarder les anciennes valeurs pour comparaison
-            $oldVotesOuverts = $edition->votes_ouverts;
-            $oldStatutVotes = $edition->statut_votes;
-            
-            // Vérifier si l'édition est active
-            if ($edition->statut !== 'active') {
-                if ($oldVotesOuverts !== false) {
-                    $edition->votes_ouverts = false;
-                    $hasChanged = true;
-                }
-                if ($oldStatutVotes !== 'en_attente') {
-                    $edition->statut_votes = 'en_attente';
-                    $hasChanged = true;
-                }
-            } else {
-                // Vérifier les dates de votes
-                if ($edition->date_debut_votes && $edition->date_fin_votes) {
-                    // Vérifier si nous sommes dans la période de votes
-                    $isInVotingPeriod = $now->between(
-                        Carbon::parse($edition->date_debut_votes), 
-                        Carbon::parse($edition->date_fin_votes)
-                    );
-                    
-                    // Vérifier si la date de fin est passée
-                    $isVotingPeriodEnded = $now->greaterThan(Carbon::parse($edition->date_fin_votes));
-                    
-                    // Vérifier si la date de début est dans le futur
-                    $isVotingPeriodNotStarted = $now->lessThan(Carbon::parse($edition->date_debut_votes));
-                    
-                    if ($isInVotingPeriod) {
-                        // Nous sommes dans la période de votes
-                        if (!$edition->inscriptions_ouvertes) {
-                            // Si les inscriptions sont fermées, ouvrir les votes
-                            if ($oldVotesOuverts !== true) {
-                                $edition->votes_ouverts = true;
-                                $hasChanged = true;
-                            }
-                            if ($oldStatutVotes !== 'en_cours') {
-                                $edition->statut_votes = 'en_cours';
-                                $hasChanged = true;
-                            }
-                        } else {
-                            // Si les inscriptions sont ouvertes, fermer les votes
-                            if ($oldVotesOuverts !== false) {
-                                $edition->votes_ouverts = false;
-                                $hasChanged = true;
-                            }
-                            if ($oldStatutVotes !== 'en_cours') {
-                                $edition->statut_votes = 'en_cours';
-                                $hasChanged = true;
-                            }
-                        }
-                    } elseif ($isVotingPeriodEnded) {
-                        // La période de votes est terminée
-                        if ($oldVotesOuverts !== false) {
-                            $edition->votes_ouverts = false;
-                            $hasChanged = true;
-                        }
-                        if ($oldStatutVotes !== 'termine') {
-                            $edition->statut_votes = 'termine';
-                            $hasChanged = true;
-                        }
-                    } elseif ($isVotingPeriodNotStarted) {
-                        // La période de votes n'a pas encore commencé
-                        if ($oldVotesOuverts !== false) {
-                            $edition->votes_ouvertes = false;
-                            $hasChanged = true;
-                        }
-                        if ($oldStatutVotes !== 'en_attente') {
-                            $edition->statut_votes = 'en_attente';
-                            $hasChanged = true;
-                        }
-                    }
-                } else {
-                    // Pas de dates de vote définies
-                    if ($oldVotesOuverts !== false) {
-                        $edition->votes_ouverts = false;
-                        $hasChanged = true;
-                    }
-                    if ($oldStatutVotes !== 'en_attente') {
-                        $edition->statut_votes = 'en_attente';
-                        $hasChanged = true;
-                    }
-                }
-            }
-            
-            // Si des changements ont été détectés, sauvegarder
-            if ($hasChanged) {
-                $edition->save();
-                Log::info('Statut édition mis à jour automatiquement', [
-                    'edition_id' => $edition->id,
-                    'nom' => $edition->nom,
-                    'old_votes_ouverts' => $oldVotesOuverts,
-                    'new_votes_ouverts' => $edition->votes_ouverts,
-                    'old_statut_votes' => $oldStatutVotes,
-                    'new_statut_votes' => $edition->statut_votes
-                ]);
-            }
-            
-            return $hasChanged;
-            
-        } catch (\Exception $e) {
-            Log::error('Erreur lors de la vérification du statut de l\'édition', [
-                'edition_id' => $edition->id,
-                'error' => $e->getMessage()
-            ]);
-            return false;
         }
     }
 
