@@ -217,8 +217,7 @@ class AdminController extends Controller
                                 $hasChanged = true;
                             }
                         }
-                    } 
-                    elseif ($isVotingPeriodEnded) {
+                    } elseif ($isVotingPeriodEnded) {
                         // La période de votes est terminée
                         if ($oldVotesOuverts !== false) {
                             $edition->votes_ouverts = false;
@@ -239,8 +238,7 @@ class AdminController extends Controller
                             $hasChanged = true;
                         }
                     }
-                } 
-                else {
+                } else {
                     // Pas de dates de vote définies
                     if ($oldVotesOuverts !== false) {
                         $edition->votes_ouverts = false;
