@@ -175,8 +175,8 @@ class AdminController extends Controller
                     $edition->votes_ouverts = false;
                     $hasChanged = true;
                 }
-                if ($oldStatutVotes !== 'en_attente') {
-                    $edition->statut_votes = 'en_attente';
+                if ($oldStatutVotes !== 'termine') {
+                    $edition->statut_votes = 'termine';
                     $hasChanged = true;
                 }
             } else {
