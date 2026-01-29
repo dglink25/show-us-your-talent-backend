@@ -217,7 +217,8 @@ class AdminController extends Controller
                                 $hasChanged = true;
                             }
                         }
-                    } elseif ($isVotingPeriodEnded) {
+                    } 
+                    elseif ($isVotingPeriodEnded) {
                         // La période de votes est terminée
                         if ($oldVotesOuverts !== false) {
                             $edition->votes_ouverts = false;
@@ -227,25 +228,27 @@ class AdminController extends Controller
                             $edition->statut_votes = 'termine';
                             $hasChanged = true;
                         }
-                    } elseif ($isVotingPeriodNotStarted) {
+                    } 
+                    elseif ($isVotingPeriodNotStarted) {
                         // La période de votes n'a pas encore commencé
                         if ($oldVotesOuverts !== false) {
                             $edition->votes_ouvertes = false;
                             $hasChanged = true;
                         }
-                        if ($oldStatutVotes !== 'en_attente') {
-                            $edition->statut_votes = 'en_attente';
+                        if ($oldStatutVotes !== 'termine') {
+                            $edition->statut_votes = 'termine';
                             $hasChanged = true;
                         }
                     }
-                } else {
+                } 
+                else {
                     // Pas de dates de vote définies
                     if ($oldVotesOuverts !== false) {
                         $edition->votes_ouverts = false;
                         $hasChanged = true;
                     }
-                    if ($oldStatutVotes !== 'en_attente') {
-                        $edition->statut_votes = 'en_attente';
+                    if ($oldStatutVotes !== 'termine') {
+                        $edition->statut_votes = 'termine';
                         $hasChanged = true;
                     }
                 }
