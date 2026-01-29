@@ -228,15 +228,14 @@ class AdminController extends Controller
                             $edition->statut_votes = 'termine';
                             $hasChanged = true;
                         }
-                    } 
-                    elseif ($isVotingPeriodNotStarted) {
+                    } elseif ($isVotingPeriodNotStarted) {
                         // La période de votes n'a pas encore commencé
                         if ($oldVotesOuverts !== false) {
                             $edition->votes_ouvertes = false;
                             $hasChanged = true;
                         }
-                        if ($oldStatutVotes !== 'termine') {
-                            $edition->statut_votes = 'termine';
+                        if ($oldStatutVotes !== 'en_attente') {
+                            $edition->statut_votes = 'en_attente';
                             $hasChanged = true;
                         }
                     }
@@ -247,8 +246,8 @@ class AdminController extends Controller
                         $edition->votes_ouverts = false;
                         $hasChanged = true;
                     }
-                    if ($oldStatutVotes !== 'termine') {
-                        $edition->statut_votes = 'termine';
+                    if ($oldStatutVotes !== 'en_attente') {
+                        $edition->statut_votes = 'en_attente';
                         $hasChanged = true;
                     }
                 }
