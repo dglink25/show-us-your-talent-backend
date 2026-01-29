@@ -45,76 +45,15 @@ class Edition extends Model
         'peut_voter'
     ];
 
-    // Toujours vérifier le statut avant de retourner les données
+    // Événements du modèle SIMPLIFIÉS
     protected static function boot()
     {
         parent::boot();
 
-        // Mettre à jour automatiquement lors de la sauvegarde
+        // Mettre à jour automatiquement votes_ouverts et statut_votes seulement lors de la sauvegarde
         static::saving(function ($edition) {
             $edition->mettreAJourStatutVotes();
         });
-
-        // Vérifier le statut à chaque récupération
-        static::retrieved(function ($edition) {
-            $edition->verifierEtMettreAJourStatutSiNecessaire();
-        });
-    }
-
-    // Méthode pour vérifier et mettre à jour si nécessaire
-    public function verifierEtMettreAJourStatutSiNecessaire()
-    {
-        // Si l'édition est inactive, ne rien faire
-        if ($this->statut !== 'active') {
-            return;
-        }
-
-        $now = Carbon::now();
-        
-        // Vérifier si les dates de fin sont dépassées
-        $shouldCloseVotes = false;
-        $shouldBeTerminated = false;
-        
-        // Vérifier la date de fin des votes
-        if ($this->date_fin_votes && $now->greaterThan($this->date_fin_votes)) {
-            $shouldCloseVotes = true;
-            $shouldBeTerminated = true;
-        }
-        
-        // Vérifier si nous sommes hors période
-        if ($this->date_debut_votes && $this->date_fin_votes) {
-            if (!$now->between($this->date_debut_votes, $this->date_fin_votes)) {
-                $shouldCloseVotes = true;
-                
-                // Si la date de début est dans le futur, c'est "en_attente"
-                if ($now->lessThan($this->date_debut_votes)) {
-                    $shouldBeTerminated = false;
-                } else {
-                    $shouldBeTerminated = true;
-                }
-            }
-        }
-
-        // Appliquer les changements si nécessaire
-        if ($shouldCloseVotes && $this->votes_ouverts) {
-            $this->votes_ouverts = false;
-            
-            if ($shouldBeTerminated && $this->statut_votes !== 'termine') {
-                $this->statut_votes = 'termine';
-                // Sauvegarder immédiatement
-                $this->saveQuietly();
-            } elseif (!$shouldBeTerminated && $this->statut_votes !== 'en_attente') {
-                $this->statut_votes = 'en_attente';
-                $this->saveQuietly();
-            }
-        } elseif (!$shouldCloseVotes && !$this->votes_ouverts && 
-                  $this->statut_votes !== 'en_cours' &&
-                  $now->between($this->date_debut_votes, $this->date_fin_votes)) {
-            // Si nous sommes dans la période et les votes ne sont pas ouverts
-            $this->votes_ouverts = true;
-            $this->statut_votes = 'en_cours';
-            $this->saveQuietly();
-        }
     }
 
     // Méthode pour mettre à jour automatiquement le statut des votes
@@ -161,9 +100,6 @@ class Edition extends Model
 
     // Accesseur pour votes_ouverts basé sur les dates (calculé à la volée)
     public function getVotesOuvertsAutoAttribute(){
-        // D'abord vérifier si on doit mettre à jour
-        $this->verifierEtMettreAJourStatutSiNecessaire();
-        
         if ($this->statut !== 'active') {
             return false;
         }
@@ -182,15 +118,12 @@ class Edition extends Model
             return false;
         }
         
-        return $votesOuverts && $this->votes_ouverts;
+        return $votesOuverts;
     }
 
     // Accesseur pour statut_votes basé sur les dates (calculé à la volée)
     public function getStatutVotesAutoAttribute()
     {
-        // D'abord vérifier si on doit mettre à jour
-        $this->verifierEtMettreAJourStatutSiNecessaire();
-        
         if ($this->statut !== 'active') {
             return 'en_attente';
         }
@@ -215,7 +148,6 @@ class Edition extends Model
         
         return $this->statut_votes;
     }
-
 
     // Accesseur pour le temps restant avant les votes
     public function getTempsRestantVotesAttribute()
