@@ -28,13 +28,12 @@ class Edition extends Model
     ];
 
     protected $casts = [
-        'inscriptions_ouvertes' => 'boolean',
-        'votes_ouverts' => 'boolean',
-        'date_debut_inscriptions' => 'datetime',
-        'date_fin_inscriptions' => 'datetime',
-        'date_debut_votes' => 'datetime',
-        'date_fin_votes' => 'datetime',
+        'date_debut_votes' => 'datetime:Y-m-d H:i:s',
+        'date_fin_votes' => 'datetime:Y-m-d H:i:s',
+        'date_debut_inscriptions' => 'datetime:Y-m-d H:i:s',
+        'date_fin_inscriptions' => 'datetime:Y-m-d H:i:s',
     ];
+
 
     // Attributs supplémentaires
     protected $appends = [

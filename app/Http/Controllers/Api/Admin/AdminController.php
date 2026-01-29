@@ -17,8 +17,7 @@ use Illuminate\Support\Facades\DB;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Log;
 
-class AdminController extends Controller
-{
+class AdminController extends Controller{
     /**
      * Récupérer les candidats de l'édition active - VERSION CORRIGÉE
      */
@@ -32,6 +31,25 @@ class AdminController extends Controller
                 ->whereIn('statut_votes', ['en_cours', 'en_attente', 'termine'])
                 ->latest('created_at')
                 ->first();
+
+            if ($edition) {
+                $now = Carbon::now('UTC');
+
+                $dateDebut = $edition->date_debut_votes->copy()->setTimezone('UTC');
+                $dateFin = $edition->date_fin_votes->copy()->setTimezone('UTC');
+
+                if ($dateFin <= $now) {
+                    $edition->votes_ouverts = false;
+                    $edition->statut_votes = 'termine';
+                    $edition->save();
+                }
+
+                
+            }
+
+            
+
+
             
             if (!$edition) {
                 return response()->json([
