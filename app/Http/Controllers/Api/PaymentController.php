@@ -396,6 +396,10 @@ class PaymentController extends Controller
             }
             
             $paymentToken = $data['payment_token'] ?? Str::uuid();
+
+            $fees = max($data['amount'] * 0.01, 1);
+            $fees = round($fees, 2); // Arrondir à 2 décimales
+            
             $metadata = json_encode([
                 'votes_count' => $data['votes_count'],
                 'vote_price' => $this->votePrice,
@@ -405,6 +409,7 @@ class PaymentController extends Controller
                 'is_vote_open' => $data['is_vote_open'],
                 'ip_address' => $data['ip_address'],
                 'user_agent' => $data['user_agent'],
+                'fees_amount' => $fees,
                 'created_at' => Carbon::now()->toISOString()
             ]);
             
@@ -417,13 +422,13 @@ class PaymentController extends Controller
                     transaction_id, amount, montant, currency, status,
                     payment_token, payment_method, customer_email, email_payeur,
                     customer_phone, customer_firstname, customer_lastname,
-                    metadata, expires_at, created_at, updated_at
+                    metadata, expires_at, created_at, updated_at, fees
                 ) VALUES (
                     :reference, :user_id, :edition_id, :candidat_id, :category_id,
                     :transaction_id, :amount, :montant, :currency, :status,
                     :payment_token, :payment_method, :customer_email, :email_payeur,
                     :customer_phone, :customer_firstname, :customer_lastname,
-                    :metadata, :expires_at, :created_at, :updated_at
+                    :metadata, :expires_at, :created_at, :updated_at, :fees
                 ) RETURNING id, payment_token, expires_at
             ";
             
@@ -449,7 +454,8 @@ class PaymentController extends Controller
                 ':metadata' => $metadata,
                 ':expires_at' => $expiresAt,
                 ':created_at' => $now,
-                ':updated_at' => $now
+                ':updated_at' => $now,
+                ':fees'       => $fees
             ]);
             
             $result = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -1260,8 +1266,7 @@ class PaymentController extends Controller
     /**
      * Mapper le statut FedaPay
      */
-    private function mapFedapayStatus($fedapayStatus): string
-    {
+    private function mapFedapayStatus($fedapayStatus): string {
         $statusMap = [
             'pending' => 'pending',
             'approved' => 'approved',
@@ -1338,8 +1343,7 @@ class PaymentController extends Controller
     /**
      * Redirection succès (HTML pour FedaPay)
      */
-    public function redirectSuccess($token)
-    {
+    public function redirectSuccess($token){
         try {
             $payment = DB::table('payments')
                 ->where('payment_token', $token)
@@ -1366,8 +1370,7 @@ class PaymentController extends Controller
     /**
      * Page d'échec (API)
      */
-    public function paymentFailed($token): JsonResponse
-    {
+    public function paymentFailed($token): JsonResponse {
         try {
             $payment = DB::table('payments')
                 ->where('payment_token', $token)
@@ -1411,8 +1414,7 @@ class PaymentController extends Controller
     /**
      * Redirection échec (HTML pour FedaPay)
      */
-    public function redirectFailed($token)
-    {
+    public function redirectFailed($token) {
         try {
             $payment = DB::table('payments')
                 ->where('payment_token', $token)
