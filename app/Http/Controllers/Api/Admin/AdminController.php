@@ -39,12 +39,11 @@ class AdminController extends Controller{
                 $dateFin = $edition->date_fin_votes->copy()->setTimezone('UTC');
 
                 if ($dateFin <= $now) {
-                    $edition->votes_ouverts = false;
-                    $edition->statut_votes = 'termine';
-                    $edition->save();
-                }
-
-                
+                    Edition::where('id', $edition->id)->update([
+                        'votes_ouverts' => false,
+                        'statut_votes' => 'termine',
+                    ]);
+                } 
             }
 
             
