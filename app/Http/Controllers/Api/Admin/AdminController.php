@@ -23,7 +23,257 @@ class AdminController extends Controller
      * Récupérer les candidats de l'édition active - VERSION CORRIGÉE
      */
     public function getCandidatsEditionActive(Request $request) {
-    
+        try {
+            // 1. Trouver l'édition active
+            $edition = Edition::select('id', 'nom', 'annee', 'numero_edition', 'statut_votes', 
+                                    'votes_ouverts', 'inscriptions_ouvertes', 'date_debut_votes', 
+                                    'date_fin_votes', 'date_debut_inscriptions', 'date_fin_inscriptions')
+                ->where('statut', 'active')
+                ->whereIn('statut_votes', ['en_cours', 'en_attente', 'termine'])
+                ->latest('created_at')
+                ->first();
+            
+            if (!$edition) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Aucune édition disponible pour le moment',
+                    'edition' => null,
+                    'categories' => [],
+                    'statistiques' => [
+                        'total_votes' => 0,
+                        'total_montant' => 0,
+                        'total_candidats' => 0,
+                        'total_votes_today' => 0,
+                        'date_dernier_vote' => null
+                    ]
+                ], 200);
+            }
+            
+            // VÉRIFICATION ET MISE À JOUR AUTOMATIQUE DU STATUT DES VOTES
+            $this->verifierEtMettreAJourStatutEdition($edition);
+            
+            // Recharger l'édition pour avoir les données à jour
+            $edition->refresh();
+            
+            // 2. Récupérer les catégories
+            $categories = Category::select('id', 'nom', 'description', 'ordre_affichage')
+                ->where('edition_id', $edition->id)
+                ->where('active', true)
+                ->orderBy('ordre_affichage')
+                ->get();
+            
+            // 3. Récupérer les candidatures valides
+            $candidatures = Candidature::select('id', 'candidat_id', 'category_id', 'video_url', 'nombre_votes')
+                ->where('edition_id', $edition->id)
+                ->where('statut', 'validee')
+                ->whereIn('category_id', $categories->pluck('id'))
+                ->with(['candidat:id,nom,prenoms,sexe,photo_url,ethnie,universite,filiere'])
+                ->orderBy('nombre_votes', 'desc')
+                ->get()
+                ->groupBy('category_id');
+            
+            // 4. Calculer les statistiques
+            $stats = $this->calculateStatistics($edition->id);
+            
+            // 5. Calculer les votes de l'utilisateur
+            $userVotes = $request->user() 
+                ? $this->getUserVotes($edition->id, $request->user()->id)
+                : [];
+            
+            // 6. Préparer les données de l'édition
+            $editionData = $this->prepareEditionData($edition);
+            
+            // 7. Calculer les votes réels pour chaque candidat et préparer les catégories
+            $categoriesData = $categories->map(function($category) use ($candidatures, $userVotes, $edition) {
+                $categoryCandidatures = $candidatures->get($category->id, collect());
+                
+                $candidats = $categoryCandidatures->map(function($candidature) use ($category, $userVotes, $edition) {
+                    if (!$candidature->candidat) return null;
+                    
+                    // Calculer les votes réels pour ce candidat
+                    $votesData = $this->calculateVotesForCandidat(
+                        $candidature->candidat_id,
+                        $candidature->category_id,
+                        $edition->id
+                    );
+                    
+                    return [
+                        'id' => $candidature->candidat->id,
+                        'candidature_id' => $candidature->id,
+                        'nom' => $candidature->candidat->nom,
+                        'prenoms' => $candidature->candidat->prenoms,
+                        'nom_complet' => $candidature->candidat->prenoms . ' ' . $candidature->candidat->nom,
+                        'sexe' => $candidature->candidat->sexe,
+                        'photo_url' => $candidature->candidat->photo_url,
+                        'photo' => $candidature->candidat->photo_url,
+                        'ethnie' => $candidature->candidat->ethnie,
+                        'universite' => $candidature->candidat->universite,
+                        'filiere' => $candidature->candidat->filiere,
+                        'video_url' => $candidature->video_url,
+                        'nombre_votes' => $votesData['total_votes'], // Utiliser les votes réels
+                        'total_montant' => $votesData['total_montant'], // Montant total des votes
+                        'a_deja_vote' => isset($userVotes[$candidature->candidat_id]),
+                        'categorie_id' => $candidature->category_id,
+                        'categorie_nom' => $category->nom,
+                    ];
+                })->filter()->values();
+                
+                // Trier par nombre de votes décroissant
+                $candidats = $candidats->sortByDesc('nombre_votes')->values();
+                
+                $totalVotesCategorie = $candidats->sum('nombre_votes');
+                $totalMontantCategorie = $candidats->sum('total_montant');
+                
+                return [
+                    'id' => $category->id,
+                    'nom' => $category->nom,
+                    'description' => $category->description,
+                    'ordre_affichage' => $category->ordre_affichage,
+                    'candidats' => $candidats,
+                    'total_votes_categorie' => $totalVotesCategorie,
+                    'total_montant_categorie' => $totalMontantCategorie,
+                    'total_candidats_categorie' => $candidats->count(),
+                ];
+            });
+            
+            return response()->json([
+                'success' => true,
+                'message' => $this->getEditionMessage($edition->statut_votes),
+                'edition' => $editionData,
+                'statistiques' => $stats,
+                'categories' => $categoriesData,
+                'user_votes' => $userVotes,
+                'user_authenticated' => $request->user() ? true : false,
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur récupération candidats edition active: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur serveur lors de la récupération des candidats'
+            ], 500);
+        }
+    }
+
+    /**
+     * Vérifier et mettre à jour automatiquement le statut de l'édition
+     */
+    private function verifierEtMettreAJourStatutEdition(Edition $edition): bool
+    {
+        try {
+            $now = Carbon::now();
+            $hasChanged = false;
+            
+            // Sauvegarder les anciennes valeurs pour comparaison
+            $oldVotesOuverts = $edition->votes_ouverts;
+            $oldStatutVotes = $edition->statut_votes;
+            
+            // Vérifier si l'édition est active
+            if ($edition->statut !== 'active') {
+                if ($oldVotesOuverts !== false) {
+                    $edition->votes_ouverts = false;
+                    $hasChanged = true;
+                }
+                if ($oldStatutVotes !== 'en_attente') {
+                    $edition->statut_votes = 'en_attente';
+                    $hasChanged = true;
+                }
+            } else {
+                // Vérifier les dates de votes
+                if ($edition->date_debut_votes && $edition->date_fin_votes) {
+                    // Vérifier si nous sommes dans la période de votes
+                    $isInVotingPeriod = $now->between(
+                        Carbon::parse($edition->date_debut_votes), 
+                        Carbon::parse($edition->date_fin_votes)
+                    );
+                    
+                    // Vérifier si la date de fin est passée
+                    $isVotingPeriodEnded = $now->greaterThan(Carbon::parse($edition->date_fin_votes));
+                    
+                    // Vérifier si la date de début est dans le futur
+                    $isVotingPeriodNotStarted = $now->lessThan(Carbon::parse($edition->date_debut_votes));
+                    
+                    if ($isInVotingPeriod) {
+                        // Nous sommes dans la période de votes
+                        if (!$edition->inscriptions_ouvertes) {
+                            // Si les inscriptions sont fermées, ouvrir les votes
+                            if ($oldVotesOuverts !== true) {
+                                $edition->votes_ouverts = true;
+                                $hasChanged = true;
+                            }
+                            if ($oldStatutVotes !== 'en_cours') {
+                                $edition->statut_votes = 'en_cours';
+                                $hasChanged = true;
+                            }
+                        } else {
+                            // Si les inscriptions sont ouvertes, fermer les votes
+                            if ($oldVotesOuverts !== false) {
+                                $edition->votes_ouverts = false;
+                                $hasChanged = true;
+                            }
+                            if ($oldStatutVotes !== 'en_cours') {
+                                $edition->statut_votes = 'en_cours';
+                                $hasChanged = true;
+                            }
+                        }
+                    } elseif ($isVotingPeriodEnded) {
+                        // La période de votes est terminée
+                        if ($oldVotesOuverts !== false) {
+                            $edition->votes_ouverts = false;
+                            $hasChanged = true;
+                        }
+                        if ($oldStatutVotes !== 'termine') {
+                            $edition->statut_votes = 'termine';
+                            $hasChanged = true;
+                        }
+                    } elseif ($isVotingPeriodNotStarted) {
+                        // La période de votes n'a pas encore commencé
+                        if ($oldVotesOuverts !== false) {
+                            $edition->votes_ouvertes = false;
+                            $hasChanged = true;
+                        }
+                        if ($oldStatutVotes !== 'en_attente') {
+                            $edition->statut_votes = 'en_attente';
+                            $hasChanged = true;
+                        }
+                    }
+                } else {
+                    // Pas de dates de vote définies
+                    if ($oldVotesOuverts !== false) {
+                        $edition->votes_ouverts = false;
+                        $hasChanged = true;
+                    }
+                    if ($oldStatutVotes !== 'en_attente') {
+                        $edition->statut_votes = 'en_attente';
+                        $hasChanged = true;
+                    }
+                }
+            }
+            
+            // Si des changements ont été détectés, sauvegarder
+            if ($hasChanged) {
+                $edition->save();
+                Log::info('Statut édition mis à jour automatiquement', [
+                    'edition_id' => $edition->id,
+                    'nom' => $edition->nom,
+                    'old_votes_ouverts' => $oldVotesOuverts,
+                    'new_votes_ouverts' => $edition->votes_ouverts,
+                    'old_statut_votes' => $oldStatutVotes,
+                    'new_statut_votes' => $edition->statut_votes
+                ]);
+            }
+            
+            return $hasChanged;
+            
+        } catch (\Exception $e) {
+            Log::error('Erreur lors de la vérification du statut de l\'édition', [
+                'edition_id' => $edition->id,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
 
     /**
      * Calculer les votes d'un candidat dans une catégorie
