@@ -1180,6 +1180,16 @@ class PaymentController extends Controller
                 'Accept' => 'application/json'
             ])->timeout(30)->post($baseUrl . '/transactions', $transactionData);
 
+            if (!$response->successful()) {
+                $errorDetails = $response->json();
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Erreur lors de la création de la transaction',
+                    'error' => $errorDetails['message'] ?? 'Erreur inconnue'
+                ], $response->status());
+            }
+
             $fedapayData = $response->json();
             $transaction = $fedapayData['v1/transaction'] ?? $fedapayData['data'] ?? null;
             
